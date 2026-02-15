@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-from calc_coef import coefficients
-from validation import validate
+from calc_coef_openox import coefficients
+from validation_openox import validation
 import os
 from pathlib import Path
 import wfdb
@@ -41,12 +41,21 @@ for file in ppg_files:
 
 coef = coefficients(path_files[0:2])
 
-
-test_file = 'data/waveforms/1/1ab221ec6347760891fcad58715195d06379a8b95db4a143eb61de8184af4cc9'
-
+'''
+test_file = 'data/waveforms/0/0ff37c5930ef49d192152d0cdcdc62c01429d40ccb095a50cc3033f39aca57d6'
 wfdb.plot_wfdb(wfdb.rdrecord(test_file+'_ppg', channels=[0,4]))
-
 if test_file in participants:
     print('participant included in training')
 else:
-    validate(coef.A,coef.B,test_file)
+    validation(coef,test_file)
+'''
+test_files = []
+for x in range(5,6):
+    pathlist = Path(pathstring + '{folder}/'.format(folder = x)).glob('**/*_ppg.dat')
+    for path in pathlist:
+        # because path is object not string
+        path_in_str = str(path)
+        if Path.is_file(path_in_str[0:-8]+'_2hz.csv'):
+            test_files.append(path_in_str[0:-8])   
+
+validation(coef,test_files[0:2],participants)
