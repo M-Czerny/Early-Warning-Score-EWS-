@@ -141,17 +141,18 @@ plt.plot(R)
 plt.plot(SpO2)
 plt.show()
 
-'''
-print(SpO2)
-plt.plot(ir)
-plt.plot(green)
-plt.plot(red)
-plt.plot(blue)
-plt.plot(accx)
-plt.plot(accy)
-plt.plot(accz)
-plt.show()
 
+print(SpO2)
+plt.plot(blue, label='blue')
+plt.plot(ir, label='ir')
+plt.plot(green, label='green')
+plt.plot(red, label='red')
+plt.plot(accx, label='accx')
+plt.plot(accy, label='accy')
+plt.plot(accz, label='accz')
+plt.legend(loc='best')
+plt.show()
+'''
 
 ac = []
 for x in range(0, int(len(accx)/ppg_fs)-1):

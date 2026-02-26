@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.signal import butter, filtfilt, find_peaks
+from scipy.signal import find_peaks
 from scipy.stats import skew, kurtosis
 from scipy.signal import welch
 
@@ -31,26 +31,33 @@ def ppg_check(ppg_window, ppg_filt, ppg_fs):
     spec_SQI = features['SQI']
 
     
-    '''
-    if pi < 0.0005:
+    if pi < 0.01:
+        
         return False
-    if sk < 0 or sk > 1.5:
+    if sk < 0 or sk > 0.4:
         return False
-    if ku < -0.5 or ku > 8:
+    
+    if ku < -1.5 or ku > 8:
         return False
+    
     if ppg_SNR < 1.5:
         return False
-    if rp < 0.3:
+    
+    if rp < 0.5:
         return False
-    if en > 5.5:
+    
+    if en > 5:
         return False
-    if hr is None or hr < 40 or hr > 180:
-        return False
-    if shape < 0.6:
-        return False
+    
+    #if shape < 0.2:
+    #    return False
+    
     if spec_SQI < 0.4:
         return False
-    '''
+    
+    if hr is None or hr < 40 or hr > 180:
+        return False
+    
 
     return True
     
