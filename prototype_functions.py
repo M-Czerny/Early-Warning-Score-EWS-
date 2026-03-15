@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import json
+import matplotlib.pyplot as plt
 
 from datetime import datetime
 from sklearn.svm import SVR
@@ -9,6 +10,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils import shuffle
 from sklearn.linear_model import LinearRegression, HuberRegressor, RANSACRegressor
 from scipy.signal import butter, filtfilt
+from random import randint
 from ppg_check import ppg_check
 
 
@@ -101,16 +103,15 @@ def ratio(red_signal, red_filt_hp, red_filt_lp, ir_signal, ir_filt_hp, ir_filt_l
     plt.show()
     '''
 
-
-    red_AC = np.std(red_filt_lp)
+    red_AC = np.std(red_filt_hp)
     red_DC = np.mean(red_filt_lp)
-    ir_AC = np.std(ir_filt_lp)
+    ir_AC = np.std(ir_filt_hp)
     ir_DC = np.mean(ir_filt_lp)
 
     #red_AC = np.max(red_filt_hp) - np.min(red_filt_hp)
-    #red_DC = np.mean(red_signal)
+    #red_DC = np.mean(red_filt_lp)
     #ir_AC = np.max(ir_filt_hp) - np.min(ir_filt_hp)
-    #ir_DC = np.mean(ir_signal)
+    #ir_DC = np.mean(ir_filt_lp)
 
     #red_AC = robust_ac(red_filt_hp)
     #red_DC = np.mean(red_signal)
@@ -130,7 +131,8 @@ def acceleration(accx, accy, accz, update_time, ppg_fs):
         a = np.sqrt(np.mean(accx[(x-window):x])**2 + np.mean(accy[(x-window):x])**2 + np.mean(accz[(x-window):x])**2)
         acc.append(a)
         #if a > 16060 or a <16045: # Session 1
-        if a > 16000 or a <12000: # Session 2
+        #if a > 16000 or a <12000: # Session 2
+        if a < 16900 or a > 17035: # Session 3
             ind.append(int(x/window)-1)
             
         
@@ -157,6 +159,21 @@ def get_datetime(session):
     datetime_str = f"{date_str} {time_str}"
 
     return datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S.%f")
+
+def get_testing_data(R_values, SpO2_values, window_len,train_percent):
+    ind = randint(0, int(len(R_values)*train_percent)+1)
+    
+    test_R_values = R_values[ind:(ind+int(len(R_values)*(1-train_percent)))+1]
+    test_SpO2_values = SpO2_values[ind:(ind+int(len(SpO2_values)*(1-train_percent)))+1]
+    if ind >= window_len:
+        train_R_values = np.concatenate((R_values[0:ind-window_len], R_values[ind+int(len(R_values)*(1-train_percent))+window_len:]), axis=0).reshape(-1, 1)
+        train_SpO2_values = np.concatenate((SpO2_values[0:ind-window_len], SpO2_values[ind+int(len(SpO2_values)*(1-train_percent))+window_len:]), axis=0)
+    else:
+        train_R_values = R_values[ind+int(len(R_values)*(1-train_percent))+window_len:].reshape(-1, 1)
+        train_SpO2_values = SpO2_values[ind+int(len(SpO2_values)*(1-train_percent))+window_len:]
+    
+
+    return train_R_values, train_SpO2_values, test_R_values, test_SpO2_values
 
 def data_shuffle(R_values, SpO2_values, window_len):
     ind = shuffle(range(0, int(len(R_values)/window_len)))

@@ -34,10 +34,10 @@ def ppg_check(ppg_window, ppg_filt, ppg_fs):
     if pi < 0.01:
         
         return False
-    if sk < 0 or sk > 0.4:
+    if sk < 0 or sk > 6:
         return False
-    
-    if ku < -1.5 or ku > 8:
+    '''
+    if ku < -1.5 or ku > 10:
         return False
     
     if ppg_SNR < 1.5:
@@ -57,7 +57,7 @@ def ppg_check(ppg_window, ppg_filt, ppg_fs):
     
     if hr is None or hr < 40 or hr > 180:
         return False
-    
+    '''
 
     return True
     
