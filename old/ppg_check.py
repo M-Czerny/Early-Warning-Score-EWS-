@@ -30,13 +30,13 @@ def ppg_check(ppg_window, ppg_filt, ppg_fs):
     shape = features['PulseShapeConsistency']
     spec_SQI = features['SQI']
 
-    
+    '''
     if pi < 0.01:
         
         return False
     if sk < 0 or sk > 6:
         return False
-    '''
+    
     if ku < -1.5 or ku > 10:
         return False
     
