@@ -1,10 +1,28 @@
+"""
+Calibration: Leave-One-Subject-Out cross-validation for SpO2 estimation.
+
+Five regression models (Linear, Quadratic, SVR, GPR, DecisionTree) are trained
+and evaluated for each LED combination.  The feature is the ratio-of-ratios R
+value (or raw AC/DC amplitudes when USE_AC_DC=True), and the target is the
+mean reference SpO2 over the window.
+
+Leave-One-Subject-Out (LOSO) cross-validation ensures that the model is always
+tested on a subject it has never seen during training, giving a realistic
+estimate of how well it will generalise to new individuals.
+
+A zero-order Kalman filter is optionally applied after prediction to smooth
+the per-window SpO2 estimates over time and reject sudden outliers.
+"""
+
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, RBF
 from sklearn.linear_model import LinearRegression
@@ -24,11 +42,12 @@ class FoldResult:
     """Predictions and metrics for one left-out subject in one model fold."""
     model_name:   str
     test_subject: str
-    y_true:       np.ndarray   # reference SpO2
-    y_pred:       np.ndarray   # predicted SpO2
+    y_true:       np.ndarray   # reference SpO2 values
+    y_pred:       np.ndarray   # predicted SpO2 values
     rmse:         float
     mae:          float
     r2:           float
+    mean_error:   float        # mean(y_pred - y_true); positive = overprediction
 
 
 # ---------------------------------------------------------------------------
@@ -36,13 +55,16 @@ class FoldResult:
 # ---------------------------------------------------------------------------
 
 def _build_models() -> Dict[str, Pipeline]:
+    """Return a fresh set of sklearn Pipeline objects — one per model type."""
     return {
         'Linear': Pipeline([
-            ('reg', LinearRegression()),
+            ('scaler', StandardScaler()),
+            ('reg',    LinearRegression()),
         ]),
         'Quadratic': Pipeline([
-            ('poly', PolynomialFeatures(degree=2, include_bias=False)),
-            ('reg',  LinearRegression()),
+            ('scaler', StandardScaler()),
+            ('poly',   PolynomialFeatures(degree=2, include_bias=False)),
+            ('reg',    LinearRegression()),
         ]),
         'SVR': Pipeline([
             ('scaler', StandardScaler()),
@@ -51,7 +73,8 @@ def _build_models() -> Dict[str, Pipeline]:
         'GPR': Pipeline([
             ('scaler', StandardScaler()),
             ('reg',    GaussianProcessRegressor(
-                           kernel=ConstantKernel(1.0) * RBF(1.0),
+                           kernel=ConstantKernel(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2)),
+                           alpha=1e-6,           # regularisation — keeps covariance matrix well-conditioned
                            n_restarts_optimizer=5,
                            normalize_y=True,
                            random_state=0,
@@ -94,7 +117,7 @@ def calibrate(
     rng = np.random.default_rng(random_seed)
 
     valid    = [w for w in windows
-                if not np.isnan(w.R) and not np.isnan(w.spo2_ref)]
+                if not np.isnan(w.R_red_ir) and not np.isnan(w.spo2_ref)]
     subjects = sorted({w.subject for w in valid})
     models   = _build_models()
     results  = {name: [] for name in models}
@@ -113,9 +136,9 @@ def calibrate(
         train_wins = list(train_wins)
         rng.shuffle(train_wins)
 
-        X_train = np.array([w.R        for w in train_wins]).reshape(-1, 1)
-        y_train = np.array([w.spo2_ref for w in train_wins])
-        X_test  = np.array([w.R        for w in test_wins]).reshape(-1, 1)
+        X_train = np.array([w.R_red_ir  for w in train_wins]).reshape(-1, 1)
+        y_train = np.array([w.spo2_ref  for w in train_wins])
+        X_test  = np.array([w.R_red_ir  for w in test_wins]).reshape(-1, 1)
         y_test  = np.array([w.spo2_ref for w in test_wins])
 
         fold_row = f"  test={test_subject:<12}  train_n={len(train_wins):>4}  test_n={len(test_wins):>3}"
@@ -123,7 +146,9 @@ def calibrate(
 
         for name, template in models.items():
             fitted = clone(template)
-            fitted.fit(X_train, y_train)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', ConvergenceWarning)
+                fitted.fit(X_train, y_train)
             y_pred = fitted.predict(X_test)
 
             rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
@@ -138,6 +163,7 @@ def calibrate(
                 rmse         = rmse,
                 mae          = mae,
                 r2           = r2,
+                mean_error   = float(np.mean(y_pred - y_test)),
             ))
             metrics.append(f"{name[:4]}={rmse:.2f}")
 
@@ -151,23 +177,59 @@ def calibrate(
 # ---------------------------------------------------------------------------
 
 # Fields on PPGWindow that correspond to each LED combination.
-# Pairs use one feature; triples use three pairwise R values; quad uses all six.
+# Pairs use one R feature; triples use three pairwise R values; quad uses all six.
 LED_COMBOS: Dict[str, List[str]] = {
     # 6 pairs
-    'Red-IR':          ['R'],
+    'Red-IR':          ['R_red_ir'],
     'Red-Green':       ['R_red_green'],
     'Red-Blue':        ['R_red_blue'],
     'IR-Green':        ['R_ir_green'],
     'IR-Blue':         ['R_ir_blue'],
     'Green-Blue':      ['R_green_blue'],
     # 4 triples (all pairwise R values within each triple)
-    'Red-IR-Green':    ['R', 'R_red_green', 'R_ir_green'],
-    'Red-IR-Blue':     ['R', 'R_red_blue',  'R_ir_blue'],
+    'Red-IR-Green':    ['R_red_ir', 'R_red_green', 'R_ir_green'],
+    'Red-IR-Blue':     ['R_red_ir', 'R_red_blue',  'R_ir_blue'],
     'Red-Green-Blue':  ['R_red_green', 'R_red_blue', 'R_green_blue'],
     'IR-Green-Blue':   ['R_ir_green',  'R_ir_blue',  'R_green_blue'],
     # 1 quadruple (all six pairwise R values)
-    'All-4LEDs':       ['R', 'R_red_green', 'R_red_blue',
+    'All-4LEDs':       ['R_red_ir', 'R_red_green', 'R_red_blue',
                         'R_ir_green', 'R_ir_blue', 'R_green_blue'],
+}
+
+# For each pair combo: (forward R field, inverse R field, inverse combo name).
+# The combo name encodes the direction: first LED is numerator, second is denominator.
+PAIR_R_FIELDS: Dict[str, tuple] = {
+    'Red-IR':     ('R_red_ir',     'R_ir_red',     'IR-Red'),
+    'Red-Green':  ('R_red_green',  'R_green_red',  'Green-Red'),
+    'Red-Blue':   ('R_red_blue',   'R_blue_red',   'Blue-Red'),
+    'IR-Green':   ('R_ir_green',   'R_green_ir',   'Green-IR'),
+    'IR-Blue':    ('R_ir_blue',    'R_blue_ir',    'Blue-IR'),
+    'Green-Blue': ('R_green_blue', 'R_blue_green', 'Blue-Green'),
+}
+
+# Constituent pairs for each multi-LED combo (order matches LED_COMBOS field order).
+COMBO_PAIRS: Dict[str, List[str]] = {
+    'Red-IR-Green':   ['Red-IR', 'Red-Green', 'IR-Green'],
+    'Red-IR-Blue':    ['Red-IR', 'Red-Blue',  'IR-Blue'],
+    'Red-Green-Blue': ['Red-Green', 'Red-Blue',  'Green-Blue'],
+    'IR-Green-Blue':  ['IR-Green',  'IR-Blue',   'Green-Blue'],
+    'All-4LEDs':      ['Red-IR', 'Red-Green', 'Red-Blue', 'IR-Green', 'IR-Blue', 'Green-Blue'],
+}
+
+# AC/DC variants — each LED contributes its bandpass std (AC) and lowpass mean (DC).
+LED_COMBOS_ACDC: Dict[str, List[str]] = {
+    'Red-IR':          ['ac_red', 'dc_red', 'ac_ir',    'dc_ir'],
+    'Red-Green':       ['ac_red', 'dc_red', 'ac_green', 'dc_green'],
+    'Red-Blue':        ['ac_red', 'dc_red', 'ac_blue',  'dc_blue'],
+    'IR-Green':        ['ac_ir',  'dc_ir',  'ac_green', 'dc_green'],
+    'IR-Blue':         ['ac_ir',  'dc_ir',  'ac_blue',  'dc_blue'],
+    'Green-Blue':      ['ac_green', 'dc_green', 'ac_blue', 'dc_blue'],
+    'Red-IR-Green':    ['ac_red', 'dc_red', 'ac_ir',    'dc_ir',    'ac_green', 'dc_green'],
+    'Red-IR-Blue':     ['ac_red', 'dc_red', 'ac_ir',    'dc_ir',    'ac_blue',  'dc_blue'],
+    'Red-Green-Blue':  ['ac_red', 'dc_red', 'ac_green', 'dc_green', 'ac_blue',  'dc_blue'],
+    'IR-Green-Blue':   ['ac_ir',  'dc_ir',  'ac_green', 'dc_green', 'ac_blue',  'dc_blue'],
+    'All-4LEDs':       ['ac_red', 'dc_red', 'ac_ir',    'dc_ir',
+                        'ac_green', 'dc_green', 'ac_blue', 'dc_blue'],
 }
 
 
@@ -178,11 +240,11 @@ def calibrate_multi(
     verbose:     bool = False,
 ) -> Dict[str, List[FoldResult]]:
     """
-    LOSO cross-validation using an arbitrary set of R-ratio fields as features.
+    LOSO cross-validation using an arbitrary set of PPGWindow fields as features.
 
-    `fields` is a list of PPGWindow attribute names (e.g. ['R'] or
-    ['R', 'R_red_green', 'R_ir_green']).  Windows where any listed field or
-    spo2_ref is NaN are silently dropped.
+    `fields` is a list of PPGWindow attribute names, e.g. ['R_red_ir'] for a
+    single pair or ['R_red_ir', 'R_red_green', 'R_ir_green'] for a triple.
+    Windows where any listed field or spo2_ref is NaN are silently dropped.
     """
     rng = np.random.default_rng(random_seed)
 
@@ -216,7 +278,9 @@ def calibrate_multi(
 
         for name, template in models.items():
             fitted = clone(template)
-            fitted.fit(X_train, y_train)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', ConvergenceWarning)
+                fitted.fit(X_train, y_train)
             y_pred = fitted.predict(X_test)
 
             rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
@@ -231,27 +295,114 @@ def calibrate_multi(
                 rmse         = rmse,
                 mae          = mae,
                 r2           = r2,
+                mean_error   = float(np.mean(y_pred - y_test)),
             ))
 
     return results
 
 
+def _best_mean_rmse(results: Dict[str, List[FoldResult]]) -> float:
+    """Lowest mean RMSE across folds for the best-performing model."""
+    return float(min(np.mean([f.rmse for f in folds]) for folds in results.values()))
+
+
 def calibrate_all_combos(
     windows,
-    random_seed: int = 42,
+    random_seed:    int                 = 42,
+    include_combos: Optional[List[str]] = None,
+    use_ac_dc:      bool                = False,
 ) -> Dict[str, Dict[str, List[FoldResult]]]:
     """
-    Run LOSO calibration for every entry in LED_COMBOS.
+    Run LOSO calibration for LED combinations.
+
+    include_combos : list of combo names to run (must be keys of LED_COMBOS).
+                     None (default) runs all combinations.
+    use_ac_dc      : False (default) → ratio-of-ratios mode (see below).
+                     True            → raw AC and DC values per LED channel.
+
+    R-ratio mode (use_ac_dc=False)
+    --------------------------------
+    For each pair combo both the forward R and its inverse are evaluated; the
+    direction with the lower best-model RMSE is kept.  Triple and quad combos
+    then use the winning direction for each of their constituent pairs.
 
     Returns a nested dict: combo_name → model_name → list[FoldResult].
     """
+    if use_ac_dc:
+        if include_combos is not None:
+            unknown = set(include_combos) - set(LED_COMBOS_ACDC)
+            if unknown:
+                raise ValueError(f"Unknown LED combo(s): {unknown}. "
+                                 f"Valid names: {list(LED_COMBOS_ACDC)}")
+        combos = {k: v for k, v in LED_COMBOS_ACDC.items()
+                  if include_combos is None or k in include_combos}
+        combo_results: Dict[str, Dict[str, List[FoldResult]]] = {}
+        for combo, fields in combos.items():
+            print(f"  {combo:<18}  [AC/DC]  {len(fields)} feature(s): {', '.join(fields)}")
+            combo_results[combo] = calibrate_multi(windows, fields,
+                                                   random_seed=random_seed)
+        return combo_results
+
+    # --- R-ratio mode ---------------------------------------------------------
+    if include_combos is not None:
+        unknown = set(include_combos) - set(LED_COMBOS)
+        if unknown:
+            raise ValueError(f"Unknown LED combo(s): {unknown}. "
+                             f"Valid names: {list(LED_COMBOS)}")
+
+    requested = set(include_combos) if include_combos is not None else set(LED_COMBOS)
+
+    # Determine which pairs must be evaluated (directly requested + constituent
+    # pairs of any requested multi-LED combo).
+    needed_pairs: set = set()
+    for combo in requested:
+        if combo in PAIR_R_FIELDS:
+            needed_pairs.add(combo)
+        elif combo in COMBO_PAIRS:
+            needed_pairs.update(COMBO_PAIRS[combo])
+
+    # Phase 1 — calibrate each needed pair in both directions, pick winner.
+    # pair_best_field   : original pair name → winning field (used internally for triples/quads)
+    # pair_output_name  : original pair name → output key (flipped if inverse wins)
+    pair_best_field:   Dict[str, str]                          = {}
+    pair_output_name:  Dict[str, str]                          = {}
+    pair_best_results: Dict[str, Dict[str, List[FoldResult]]]  = {}
+
+    for pair, (fwd, inv, inv_name) in PAIR_R_FIELDS.items():
+        if pair not in needed_pairs:
+            continue
+        res_fwd  = calibrate_multi(windows, [fwd], random_seed=random_seed)
+        res_inv  = calibrate_multi(windows, [inv], random_seed=random_seed)
+        rmse_fwd = _best_mean_rmse(res_fwd)
+        rmse_inv = _best_mean_rmse(res_inv)
+        if rmse_fwd <= rmse_inv:
+            pair_best_field[pair]   = fwd
+            pair_output_name[pair]  = pair        # forward keeps the original name
+            pair_best_results[pair] = res_fwd
+            winner_field, loser_field, wr, lr = fwd, inv, rmse_fwd, rmse_inv
+            winner_name = pair
+        else:
+            pair_best_field[pair]   = inv
+            pair_output_name[pair]  = inv_name    # inverse flips the name
+            pair_best_results[pair] = res_inv
+            winner_field, loser_field, wr, lr = inv, fwd, rmse_inv, rmse_fwd
+            winner_name = inv_name
+        print(f"  {pair:<18}  [R-ratio]  winner: {winner_name} ({winner_field},"
+              f" RMSE={wr:.3f})  vs {loser_field} (RMSE={lr:.3f})")
+
+    # Phase 2 — assemble output in LED_COMBOS order.
     combo_results: Dict[str, Dict[str, List[FoldResult]]] = {}
-    for combo, fields in LED_COMBOS.items():
-        n_feat = len(fields)
-        print(f"  {combo:<18}  {n_feat} feature(s): {', '.join(fields)}")
-        combo_results[combo] = calibrate_multi(windows, fields,
-                                               random_seed=random_seed,
-                                               verbose=False)
+    for combo in LED_COMBOS:
+        if combo not in requested:
+            continue
+        if combo in PAIR_R_FIELDS:
+            out_name = pair_output_name[combo]
+            combo_results[out_name] = pair_best_results[combo]
+        else:
+            fields = [pair_best_field[p] for p in COMBO_PAIRS[combo]]
+            print(f"  {combo:<18}  [R-ratio]  {len(fields)} feature(s): {', '.join(fields)}")
+            combo_results[combo] = calibrate_multi(windows, fields,
+                                                   random_seed=random_seed)
     return combo_results
 
 
@@ -351,9 +502,10 @@ def apply_kalman_to_results(
             fold.y_pred = _zero_order_kalman(
                 fold.y_pred, Q=Q, R=R, reject_sigma=reject_sigma,
             )
-            fold.rmse = float(np.sqrt(np.mean((fold.y_true - fold.y_pred) ** 2)))
-            fold.mae  = float(mean_absolute_error(fold.y_true, fold.y_pred))
-            fold.r2   = float(r2_score(fold.y_true, fold.y_pred))
+            fold.rmse       = float(np.sqrt(np.mean((fold.y_true - fold.y_pred) ** 2)))
+            fold.mae        = float(mean_absolute_error(fold.y_true, fold.y_pred))
+            fold.r2         = float(r2_score(fold.y_true, fold.y_pred))
+            fold.mean_error = float(np.mean(fold.y_pred - fold.y_true))
     return results
 
 
@@ -362,14 +514,17 @@ def apply_kalman_to_results(
 # ---------------------------------------------------------------------------
 
 def summarise(results: Dict[str, List[FoldResult]]) -> None:
-    """Print mean ± std of RMSE, MAE and R² across all folds per model."""
-    print(f"\n  {'Model':<14} {'RMSE':>6}±{'std':>5}   {'MAE':>6}±{'std':>5}   {'R²':>6}±{'std':>5}")
-    print("  " + "-" * 62)
+    """Print mean ± std of RMSE, MAE, R² and mean error across all folds per model."""
+    print(f"\n  {'Model':<14} {'RMSE':>6}±{'std':>5}   {'MAE':>6}±{'std':>5}   "
+          f"{'R²':>6}±{'std':>5}   {'Bias':>6}±{'std':>5}")
+    print("  " + "-" * 80)
     for name, folds in results.items():
-        rmses = np.array([f.rmse for f in folds])
-        maes  = np.array([f.mae  for f in folds])
-        r2s   = np.array([f.r2   for f in folds])
+        rmses  = np.array([f.rmse       for f in folds])
+        maes   = np.array([f.mae        for f in folds])
+        r2s    = np.array([f.r2         for f in folds])
+        biases = np.array([f.mean_error for f in folds])
         print(f"  {name:<14} "
               f"{rmses.mean():>6.3f}±{rmses.std():>5.3f}   "
               f"{maes.mean():>6.3f}±{maes.std():>5.3f}   "
-              f"{r2s.mean():>6.3f}±{r2s.std():>5.3f}")
+              f"{r2s.mean():>6.3f}±{r2s.std():>5.3f}   "
+              f"{biases.mean():>+6.3f}±{biases.std():>5.3f}")

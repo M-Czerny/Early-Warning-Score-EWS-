@@ -1,3 +1,15 @@
+"""
+Signal acquisition: discover and load raw PPG and SpO2 files.
+
+Two separate devices produce two files per session:
+  - PPG file   : named as a Unix-millisecond timestamp (e.g. 1776952668764.txt).
+                 Contains 4 optical LED channels (IR, Red, Green, Blue) and a
+                 3-axis accelerometer, all sampled at 50 Hz.
+  - SpO2 file  : named opensignals_*.txt (BITalino / OpenSignals format).
+                 Contains reference pulse oximetry (SpO2 %) alongside its own
+                 Red and IR channels, sampled at 100 Hz.
+"""
+
 import os
 import re
 import pandas as pd
@@ -12,7 +24,7 @@ def _find_ppg_file(directory):
 
 
 def _find_spo2_file(directory):
-    """Find the opensignals .txt file in a directory."""
+    """Find the opensignals .txt file (reference SpO2 device) in a directory."""
     for fname in os.listdir(directory):
         if fname.startswith('opensignals') and fname.endswith('.txt'):
             return os.path.join(directory, fname)
@@ -20,7 +32,7 @@ def _find_spo2_file(directory):
 
 
 def _load_ppg(filepath):
-    """Load 4 PPG signals and 3 accelerometer signals from a UTC-timestamp file."""
+    """Load 4 optical PPG channels and 3-axis accelerometer from the prototype device file."""
     df = pd.read_csv(
         filepath,
         sep='\t',
@@ -38,13 +50,13 @@ def _load_ppg(filepath):
 
 
 def _load_spo2(filepath):
-    """Load channels 9 (red), 10 (ir), 11 (%SpO2) from an opensignals file."""
+    """Load reference SpO2 (%) plus its Red and IR channels from an opensignals file."""
     # Rows have a trailing tab, so pandas sees an extra empty column — use
     # positional indexing (cols 2=red, 3=ir, 4=spo2) to stay robust.
     df = pd.read_csv(
         filepath,
         sep='\t',
-        skiprows=3,
+        skiprows=3,   # skip two comment lines and the JSON header
         header=None,
         usecols=[2, 3, 4],
     )
@@ -57,7 +69,7 @@ def _load_spo2(filepath):
 
 
 def _load_session(directory, subject, episode=None):
-    """Load one recording session (subject + optional episode) from a directory."""
+    """Load one recording session: find both device files and return a record dict."""
     ppg_path  = _find_ppg_file(directory)
     spo2_path = _find_spo2_file(directory)
 
@@ -67,18 +79,22 @@ def _load_session(directory, subject, episode=None):
         raise FileNotFoundError(f"No SpO2 file found in {directory}")
 
     return {
-        'subject':  subject,
-        'episode':  episode,
-        'ppg_path': ppg_path,
+        'subject':   subject,
+        'episode':   episode,
+        'ppg_path':  ppg_path,
         'spo2_path': spo2_path,
-        'ppg':      _load_ppg(ppg_path),
-        'spo2':     _load_spo2(spo2_path),
+        'ppg':       _load_ppg(ppg_path),
+        'spo2':      _load_spo2(spo2_path),
     }
 
 
 def load_all_subjects(data_dir):
     """
     Walk data_dir and load every subject/episode.
+
+    Supports two folder layouts:
+      - Flat   : prototype_data/subject1/<files>
+      - Nested : prototype_data/subject1/episode 1/<files>
 
     Returns a list of dicts, each with keys:
         subject (str), episode (str | None), ppg (dict), spo2 (dict)
