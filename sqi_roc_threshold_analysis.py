@@ -54,7 +54,7 @@ from sklearn.metrics import auc as sklearn_auc
 # Constants
 # ---------------------------------------------------------------------------
 
-ARMS_REJECT_THRESHOLD_DEFAULT = 3.5   # % SpO2 error above which window is REJECT
+ARMS_REJECT_THRESHOLD_DEFAULT = 0.5   # % SpO2 error above which window is REJECT
 
 # SQI metrics analysed (column names in windows_df)
 METRICS_SINGLE = [
@@ -591,6 +591,112 @@ def _figure_composite_roc(roc_results: dict, save_path: str) -> None:
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# RMSE-optimal threshold search
+# ---------------------------------------------------------------------------
+
+def find_rmse_optimal_threshold(
+    windows_list:   list,
+    random_seed:    int   = 42,
+    n_sweep:        int   = 20,
+    save_dir:       str   = 'results/sqi_roc',
+    include_combos        = None,
+    use_ac_dc:      bool  = False,
+    svr_C:          float = 100.0,
+    svr_epsilon:    float = 0.1,
+    svr_gamma               = 'scale',
+    gpr_alpha:      float = 1e-6,
+    gpr_n_restarts: int   = 5,
+) -> dict:
+    """
+    Find the composite SQI threshold that minimises mean LOSO RMSE directly.
+
+    Unlike Youden-based optimisation (which maximises classification accuracy
+    for detecting high-ARMS windows), this sweeps the threshold over the full
+    calibration pipeline and picks the value that produces the lowest
+    cross-validated RMSE.
+
+    Parameters
+    ----------
+    windows_list : list of PPGWindow objects (the full pre-SQI window set).
+    n_sweep      : number of evenly spaced percentile candidates to evaluate.
+
+    Returns
+    -------
+    dict with keys: optimal_threshold, optimal_rmse, sweep_results
+    """
+    from data_extraction import composite_sqi_score, fit_composite_sqi_scaler, \
+                                 apply_composite_sqi_fitted
+    from calibration import calibrate_all_combos
+
+    if not windows_list:
+        return {}
+
+    scaler = fit_composite_sqi_scaler(windows_list)
+    lo, hi = scaler
+
+    raw_scores = np.array([composite_sqi_score(w) for w in windows_list])
+    candidates_raw = np.percentile(raw_scores, np.linspace(5, 80, n_sweep))
+    candidates_raw = np.unique(candidates_raw)
+
+    sweep_results = []
+    print(f"\n[RMSE sweep]  {'threshold':>10}  {'n_kept':>7}  {'best_RMSE':>10}")
+    for raw_thr in candidates_raw:
+        thr_norm = float((raw_thr - lo) / (hi - lo)) if hi > lo else 0.0
+        kept = apply_composite_sqi_fitted(windows_list, thr_norm, scaler)
+        if len(kept) < 10:
+            continue
+        cv = calibrate_all_combos(
+            kept, random_seed=random_seed,
+            include_combos=include_combos, use_ac_dc=use_ac_dc,
+            svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+            gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+        )
+        # Best mean RMSE across models, evaluated on first (or only) combo
+        first_combo = next(iter(cv.values())) if cv else {}
+        if not first_combo:
+            continue
+        best_rmse = min(
+            sum(f.rmse for f in folds) / len(folds)
+            for folds in first_combo.values() if folds
+        )
+        sweep_results.append({
+            'threshold': thr_norm,
+            'n_kept':    len(kept),
+            'rmse':      best_rmse,
+        })
+        print(f"[RMSE sweep]  {thr_norm:>10.4f}  {len(kept):>7}  {best_rmse:>10.4f}")
+
+    if not sweep_results:
+        return {}
+
+    best = min(sweep_results, key=lambda r: r['rmse'])
+    print(f"[RMSE sweep]  optimal threshold = {best['threshold']:.4f}  "
+          f"RMSE = {best['rmse']:.4f}  n_kept = {best['n_kept']}")
+
+    # Persist the RMSE-optimal threshold alongside the Youden thresholds.
+    json_path = Path(save_dir) / 'optimal_thresholds.json'
+    if json_path.exists():
+        with open(json_path) as fh:
+            opt_json = json.load(fh)
+    else:
+        opt_json = {}
+    composite_entry = opt_json.setdefault('composite_sqi', {})
+    composite_entry['rmse_optimal_threshold'] = best['threshold']
+    composite_entry['rmse_optimal_n_kept']    = best['n_kept']
+    composite_entry['rmse_optimal_value']     = best['rmse']
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    with open(json_path, 'w') as fh:
+        json.dump(opt_json, fh, indent=2)
+    print(f"[RMSE sweep]  saved to {json_path}")
+
+    return {
+        'optimal_threshold': best['threshold'],
+        'optimal_rmse':      best['rmse'],
+        'sweep_results':     sweep_results,
+    }
 
 
 # ---------------------------------------------------------------------------

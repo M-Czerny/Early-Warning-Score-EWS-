@@ -16,9 +16,10 @@ the per-window SpO2 estimates over time and reject sudden outliers.
 
 from __future__ import annotations
 
+import copy
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from sklearn.base import clone
@@ -54,7 +55,13 @@ class FoldResult:
 # Model definitions
 # ---------------------------------------------------------------------------
 
-def _build_models() -> Dict[str, Pipeline]:
+def _build_models(
+    svr_C:               float = 100.0,
+    svr_epsilon:         float = 0.1,
+    svr_gamma:           Union[float, str] = 'scale',
+    gpr_alpha:           float = 1e-6,
+    gpr_n_restarts:      int   = 5,
+) -> Dict[str, Pipeline]:
     """Return a fresh set of sklearn Pipeline objects — one per model type."""
     return {
         'Linear': Pipeline([
@@ -68,14 +75,14 @@ def _build_models() -> Dict[str, Pipeline]:
         ]),
         'SVR': Pipeline([
             ('scaler', StandardScaler()),
-            ('reg',    SVR(kernel='rbf', C=100.0, epsilon=0.1, gamma='scale')),
+            ('reg',    SVR(kernel='rbf', C=svr_C, epsilon=svr_epsilon, gamma=svr_gamma)),
         ]),
         'GPR': Pipeline([
             ('scaler', StandardScaler()),
             ('reg',    GaussianProcessRegressor(
                            kernel=ConstantKernel(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2)),
-                           alpha=1e-6,           # regularisation — keeps covariance matrix well-conditioned
-                           n_restarts_optimizer=5,
+                           alpha=gpr_alpha,
+                           n_restarts_optimizer=gpr_n_restarts,
                            normalize_y=True,
                            random_state=0,
                        )),
@@ -235,9 +242,14 @@ LED_COMBOS_ACDC: Dict[str, List[str]] = {
 
 def calibrate_multi(
     windows,
-    fields:      List[str],
-    random_seed: int  = 42,
-    verbose:     bool = False,
+    fields:          List[str],
+    random_seed:     int              = 42,
+    verbose:         bool             = False,
+    svr_C:           float            = 100.0,
+    svr_epsilon:     float            = 0.1,
+    svr_gamma:       Union[float, str] = 'scale',
+    gpr_alpha:       float            = 1e-6,
+    gpr_n_restarts:  int              = 5,
 ) -> Dict[str, List[FoldResult]]:
     """
     LOSO cross-validation using an arbitrary set of PPGWindow fields as features.
@@ -254,7 +266,10 @@ def calibrate_multi(
         and not np.isnan(w.spo2_ref)
     ]
     subjects = sorted({w.subject for w in valid})
-    models   = _build_models()
+    models   = _build_models(
+        svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+        gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+    )
     results  = {name: [] for name in models}
 
     if verbose:
@@ -311,6 +326,11 @@ def calibrate_all_combos(
     random_seed:    int                 = 42,
     include_combos: Optional[List[str]] = None,
     use_ac_dc:      bool                = False,
+    svr_C:          float               = 100.0,
+    svr_epsilon:    float               = 0.1,
+    svr_gamma:      Union[float, str]   = 'scale',
+    gpr_alpha:      float               = 1e-6,
+    gpr_n_restarts: int                 = 5,
 ) -> Dict[str, Dict[str, List[FoldResult]]]:
     """
     Run LOSO calibration for LED combinations.
@@ -339,8 +359,11 @@ def calibrate_all_combos(
         combo_results: Dict[str, Dict[str, List[FoldResult]]] = {}
         for combo, fields in combos.items():
             print(f"  {combo:<18}  [AC/DC]  {len(fields)} feature(s): {', '.join(fields)}")
-            combo_results[combo] = calibrate_multi(windows, fields,
-                                                   random_seed=random_seed)
+            combo_results[combo] = calibrate_multi(
+                windows, fields, random_seed=random_seed,
+                svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+                gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+            )
         return combo_results
 
     # --- R-ratio mode ---------------------------------------------------------
@@ -371,8 +394,16 @@ def calibrate_all_combos(
     for pair, (fwd, inv, inv_name) in PAIR_R_FIELDS.items():
         if pair not in needed_pairs:
             continue
-        res_fwd  = calibrate_multi(windows, [fwd], random_seed=random_seed)
-        res_inv  = calibrate_multi(windows, [inv], random_seed=random_seed)
+        res_fwd  = calibrate_multi(
+            windows, [fwd], random_seed=random_seed,
+            svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+            gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+        )
+        res_inv  = calibrate_multi(
+            windows, [inv], random_seed=random_seed,
+            svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+            gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+        )
         rmse_fwd = _best_mean_rmse(res_fwd)
         rmse_inv = _best_mean_rmse(res_inv)
         if rmse_fwd <= rmse_inv:
@@ -401,8 +432,11 @@ def calibrate_all_combos(
         else:
             fields = [pair_best_field[p] for p in COMBO_PAIRS[combo]]
             print(f"  {combo:<18}  [R-ratio]  {len(fields)} feature(s): {', '.join(fields)}")
-            combo_results[combo] = calibrate_multi(windows, fields,
-                                                   random_seed=random_seed)
+            combo_results[combo] = calibrate_multi(
+                windows, fields, random_seed=random_seed,
+                svr_C=svr_C, svr_epsilon=svr_epsilon, svr_gamma=svr_gamma,
+                gpr_alpha=gpr_alpha, gpr_n_restarts=gpr_n_restarts,
+            )
     return combo_results
 
 
@@ -528,3 +562,132 @@ def summarise(results: Dict[str, List[FoldResult]]) -> None:
               f"{maes.mean():>6.3f}±{maes.std():>5.3f}   "
               f"{r2s.mean():>6.3f}±{r2s.std():>5.3f}   "
               f"{biases.mean():>+6.3f}±{biases.std():>5.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter tuning helpers
+# ---------------------------------------------------------------------------
+
+def _model_mean_rmse(
+    combo_results: Dict[str, Dict[str, List[FoldResult]]],
+    model_name:    str,
+) -> float:
+    """Mean RMSE for one model across all LED combos."""
+    rmses = [
+        float(np.mean([f.rmse for f in folds]))
+        for results in combo_results.values()
+        if model_name in results
+        for folds in [results[model_name]]
+        if folds
+    ]
+    return float(np.mean(rmses)) if rmses else float('nan')
+
+
+def grid_search_model_params(
+    windows,
+    svr_C_grid:       Sequence[float] = (0.1, 1.0, 10.0, 100.0, 500.0),
+    svr_epsilon_grid: Sequence[float] = (0.01, 0.1, 0.5, 1.0),
+    gpr_alpha_grid:   Sequence[float] = (0.001, 0.01, 0.1, 0.5, 1.0, 2.0),
+    random_seed:      int             = 42,
+    include_combos                    = None,
+    use_ac_dc:        bool            = False,
+    svr_gamma                         = 'scale',
+    gpr_n_restarts:   int             = 5,
+) -> dict:
+    """
+    Sweep SVR (C, epsilon) and GPR (alpha) independently.
+
+    Runs a 2-D grid over SVR C × epsilon (GPR alpha held at its median grid
+    value), then a 1-D sweep over GPR alpha (SVR held at current defaults).
+    Reports the per-model RMSE for each config and prints a sorted table.
+
+    Returns dict with keys 'svr' and 'gpr', each a list of result dicts
+    sorted by ascending RMSE.
+    """
+    gpr_alpha_default = sorted(gpr_alpha_grid)[len(gpr_alpha_grid) // 2]
+    svr_C_default     = 100.0
+    svr_eps_default   = 0.1
+
+    # --- SVR: C × epsilon grid -----------------------------------------------
+    svr_rows: list = []
+    print(f"\n[Model tuning]  SVR: C × epsilon  "
+          f"(GPR alpha fixed at {gpr_alpha_default})")
+    print(f"  {'C':>10}  {'epsilon':>9}  {'SVR RMSE':>10}")
+    for C in svr_C_grid:
+        for eps in svr_epsilon_grid:
+            cv   = calibrate_all_combos(
+                windows, random_seed=random_seed,
+                include_combos=include_combos, use_ac_dc=use_ac_dc,
+                svr_C=C, svr_epsilon=eps, svr_gamma=svr_gamma,
+                gpr_alpha=gpr_alpha_default, gpr_n_restarts=gpr_n_restarts,
+            )
+            rmse = _model_mean_rmse(cv, 'SVR')
+            svr_rows.append({'C': C, 'epsilon': eps, 'rmse': rmse})
+            print(f"  {C:>10.2f}  {eps:>9.3f}  {rmse:>10.4f}")
+
+    svr_rows.sort(key=lambda r: r['rmse'])
+    best = svr_rows[0]
+    print(f"  → best: C={best['C']}, epsilon={best['epsilon']}, RMSE={best['rmse']:.4f}")
+
+    # --- GPR: alpha sweep ----------------------------------------------------
+    gpr_rows: list = []
+    print(f"\n[Model tuning]  GPR: alpha  "
+          f"(SVR C={svr_C_default}, epsilon={svr_eps_default})")
+    print(f"  {'alpha':>12}  {'GPR RMSE':>10}")
+    for alpha in gpr_alpha_grid:
+        cv   = calibrate_all_combos(
+            windows, random_seed=random_seed,
+            include_combos=include_combos, use_ac_dc=use_ac_dc,
+            svr_C=svr_C_default, svr_epsilon=svr_eps_default, svr_gamma=svr_gamma,
+            gpr_alpha=alpha, gpr_n_restarts=gpr_n_restarts,
+        )
+        rmse = _model_mean_rmse(cv, 'GPR')
+        gpr_rows.append({'alpha': alpha, 'rmse': rmse})
+        print(f"  {alpha:>12.4f}  {rmse:>10.4f}")
+
+    gpr_rows.sort(key=lambda r: r['rmse'])
+    best = gpr_rows[0]
+    print(f"  → best: alpha={best['alpha']}, RMSE={best['rmse']:.4f}")
+
+    return {'svr': svr_rows, 'gpr': gpr_rows}
+
+
+def sweep_kalman_params(
+    combo_results_base: Dict[str, Dict[str, List[FoldResult]]],
+    Q_grid:     Sequence[float] = (0.1, 0.3, 0.5, 1.0, 2.0, 5.0),
+    R_grid:     Sequence[float] = (0.5, 1.0, 2.0, 5.0, 10.0),
+    sigma_grid: Sequence[float] = (2.0, 3.0, 4.0, 5.0),
+) -> list:
+    """
+    Sweep Kalman filter parameters on pre-computed LOSO predictions.
+
+    combo_results_base must be the output of calibrate_all_combos() BEFORE
+    any Kalman filter has been applied so that y_pred holds raw predictions.
+
+    Deep-copies the results for each parameter combination so the originals
+    are never mutated.  Returns a list of result dicts sorted by best RMSE.
+    """
+    n_combos = len(Q_grid) * len(R_grid) * len(sigma_grid)
+    print(f"\n[Kalman tuning]  Q × R × sigma  ({n_combos} combinations)")
+    print(f"  {'Q':>6}  {'R':>6}  {'sigma':>6}  {'best_RMSE':>10}")
+
+    rows: list = []
+    for Q in Q_grid:
+        for R in R_grid:
+            for sigma in sigma_grid:
+                cv_copy  = copy.deepcopy(combo_results_base)
+                apply_kalman_to_all_combos(cv_copy, Q=Q, R=R, reject_sigma=sigma)
+                best_rmse = min(
+                    float(np.mean([f.rmse for f in folds]))
+                    for results in cv_copy.values()
+                    for folds in results.values()
+                    if folds
+                )
+                rows.append({'Q': Q, 'R': R, 'sigma': sigma, 'rmse': best_rmse})
+                print(f"  {Q:>6.2f}  {R:>6.2f}  {sigma:>6.2f}  {best_rmse:>10.4f}")
+
+    rows.sort(key=lambda r: r['rmse'])
+    best = rows[0]
+    print(f"  → best: Q={best['Q']}, R={best['R']}, sigma={best['sigma']}, "
+          f"RMSE={best['rmse']:.4f}")
+    return rows

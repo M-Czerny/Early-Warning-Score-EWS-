@@ -345,15 +345,21 @@ def apply_sqi(
     rel_power_min:    Optional[float] = None,
     rel_power_max:    Optional[float] = None,
     acc_std_max:      Optional[float] = None,
+    ir_only_metrics:  bool            = False,
 ) -> List[PPGWindow]:
     """
     Drop windows that fall outside quality thresholds.
 
-    Spectral metrics (skewness, kurtosis, SNR, entropy, relative power) are
-    checked on *all four* optical channels — a window is rejected if any
-    channel is out of range.
-    acc_std_max rejects windows where acceleration energy std-dev exceeds the
-    limit (indicates motion within the window).
+    By default, spectral metrics (skewness, kurtosis, SNR, entropy,
+    relative power) are checked on *all four* optical channels — a window
+    is rejected if any channel is out of range.
+
+    Set ir_only_metrics=True to check spectral metrics on the IR channel
+    only, matching the single-channel analysis used when Youden thresholds
+    were derived in sqi_roc_threshold_analysis.py.
+
+    acc_std_max rejects windows where acceleration energy std-dev exceeds
+    the limit (indicates motion within the window).
     Any threshold left as None imposes no bound on that side.
 
     Returns the filtered list and prints a rejection summary.
@@ -361,32 +367,53 @@ def apply_sqi(
     kept = []
     for w in windows:
         if not _in_range(w.pi,             pi_min,        pi_max):        continue
-        if not _in_range(w.skewness_red,    skewness_min,  skewness_max):  continue
-        if not _in_range(w.skewness_ir,     skewness_min,  skewness_max):  continue
-        if not _in_range(w.skewness_green,  skewness_min,  skewness_max):  continue
-        if not _in_range(w.skewness_blue,   skewness_min,  skewness_max):  continue
-        if not _in_range(w.kurtosis_red,    kurtosis_min,  kurtosis_max):  continue
-        if not _in_range(w.kurtosis_ir,     kurtosis_min,  kurtosis_max):  continue
-        if not _in_range(w.kurtosis_green,  kurtosis_min,  kurtosis_max):  continue
-        if not _in_range(w.kurtosis_blue,   kurtosis_min,  kurtosis_max):  continue
-        if not _in_range(w.snr_red,         snr_min,       snr_max):       continue
-        if not _in_range(w.snr_ir,          snr_min,       snr_max):       continue
-        if not _in_range(w.snr_green,       snr_min,       snr_max):       continue
-        if not _in_range(w.snr_blue,        snr_min,       snr_max):       continue
-        if not _in_range(w.entropy_red,     entropy_min,   entropy_max):   continue
-        if not _in_range(w.entropy_ir,      entropy_min,   entropy_max):   continue
-        if not _in_range(w.entropy_green,   entropy_min,   entropy_max):   continue
-        if not _in_range(w.entropy_blue,    entropy_min,   entropy_max):   continue
-        if not _in_range(w.rel_power_red,   rel_power_min, rel_power_max): continue
-        if not _in_range(w.rel_power_ir,    rel_power_min, rel_power_max): continue
-        if not _in_range(w.rel_power_green, rel_power_min, rel_power_max): continue
-        if not _in_range(w.rel_power_blue,  rel_power_min, rel_power_max): continue
+        # --- skewness ---
+        if ir_only_metrics:
+            if not _in_range(w.skewness_ir,  skewness_min, skewness_max): continue
+        else:
+            if not _in_range(w.skewness_red,   skewness_min, skewness_max): continue
+            if not _in_range(w.skewness_ir,    skewness_min, skewness_max): continue
+            if not _in_range(w.skewness_green, skewness_min, skewness_max): continue
+            if not _in_range(w.skewness_blue,  skewness_min, skewness_max): continue
+        # --- kurtosis ---
+        if ir_only_metrics:
+            if not _in_range(w.kurtosis_ir,  kurtosis_min, kurtosis_max): continue
+        else:
+            if not _in_range(w.kurtosis_red,   kurtosis_min, kurtosis_max): continue
+            if not _in_range(w.kurtosis_ir,    kurtosis_min, kurtosis_max): continue
+            if not _in_range(w.kurtosis_green, kurtosis_min, kurtosis_max): continue
+            if not _in_range(w.kurtosis_blue,  kurtosis_min, kurtosis_max): continue
+        # --- SNR ---
+        if ir_only_metrics:
+            if not _in_range(w.snr_ir,       snr_min, snr_max): continue
+        else:
+            if not _in_range(w.snr_red,        snr_min, snr_max): continue
+            if not _in_range(w.snr_ir,         snr_min, snr_max): continue
+            if not _in_range(w.snr_green,      snr_min, snr_max): continue
+            if not _in_range(w.snr_blue,       snr_min, snr_max): continue
+        # --- spectral entropy ---
+        if ir_only_metrics:
+            if not _in_range(w.entropy_ir,   entropy_min, entropy_max): continue
+        else:
+            if not _in_range(w.entropy_red,    entropy_min, entropy_max): continue
+            if not _in_range(w.entropy_ir,     entropy_min, entropy_max): continue
+            if not _in_range(w.entropy_green,  entropy_min, entropy_max): continue
+            if not _in_range(w.entropy_blue,   entropy_min, entropy_max): continue
+        # --- relative power ---
+        if ir_only_metrics:
+            if not _in_range(w.rel_power_ir, rel_power_min, rel_power_max): continue
+        else:
+            if not _in_range(w.rel_power_red,   rel_power_min, rel_power_max): continue
+            if not _in_range(w.rel_power_ir,    rel_power_min, rel_power_max): continue
+            if not _in_range(w.rel_power_green, rel_power_min, rel_power_max): continue
+            if not _in_range(w.rel_power_blue,  rel_power_min, rel_power_max): continue
         if not _in_range(w.acc_energy_std, None,          acc_std_max):   continue
         kept.append(w)
 
     n_total    = len(windows)
     n_rejected = n_total - len(kept)
-    print(f"  SQI: kept {len(kept)} / {n_total} windows ({n_rejected} rejected, "
+    mode_tag   = " (IR-only)" if ir_only_metrics else ""
+    print(f"  SQI{mode_tag}: kept {len(kept)} / {n_total} windows ({n_rejected} rejected, "
           f"{100 * n_rejected / n_total:.1f}%)")
     return kept
 
@@ -432,6 +459,11 @@ def apply_composite_sqi(
 
     composite_min should be a percentile of the score distribution, e.g.
     the 25th percentile retains the top 75 % of windows by quality.
+
+    NOTE: This re-normalises over the passed population on every call, so
+    the threshold meaning shifts when the population changes.  For stable,
+    reproducible thresholds use fit_composite_sqi_scaler() +
+    apply_composite_sqi_fitted() instead.
     """
     scores = np.array([composite_sqi_score(w) for w in windows])
 
@@ -448,4 +480,46 @@ def apply_composite_sqi(
     n_rejected = n_total - len(kept)
     print(f"  Composite SQI (min={composite_min:.3f}): kept {len(kept)} / {n_total} "
           f"windows ({n_rejected} rejected, {100 * n_rejected / n_total:.1f}%)")
+    return kept
+
+
+def fit_composite_sqi_scaler(windows: List[PPGWindow]) -> tuple:
+    """
+    Compute the (lo, hi) normalisation range from a reference population.
+
+    Fit once on the full pre-SQI window set; reuse the returned tuple in
+    apply_composite_sqi_fitted() so the threshold value has the same
+    percentile meaning regardless of which subset is later filtered.
+    """
+    scores = np.array([composite_sqi_score(w) for w in windows])
+    lo, hi = float(scores.min()), float(scores.max())
+    if hi == lo:
+        return 0.0, 1.0
+    return lo, hi
+
+
+def apply_composite_sqi_fitted(
+    windows:       List[PPGWindow],
+    composite_min: float,
+    scaler:        tuple,
+) -> List[PPGWindow]:
+    """
+    Keep windows whose composite SQI score >= composite_min, using a
+    pre-fitted (lo, hi) normalisation range from fit_composite_sqi_scaler().
+
+    Using a fixed scaler ensures the threshold means the same percentile
+    of quality regardless of which population subset is passed.
+    """
+    lo, hi = scaler
+    scores = np.array([composite_sqi_score(w) for w in windows])
+    if hi > lo:
+        norm_scores = (scores - lo) / (hi - lo)
+    else:
+        norm_scores = np.zeros_like(scores)
+
+    kept = [w for w, s in zip(windows, norm_scores) if s >= composite_min]
+    n_total    = len(windows)
+    n_rejected = n_total - len(kept)
+    print(f"  Composite SQI fitted (min={composite_min:.3f}): kept {len(kept)} / {n_total} "
+          f"({100 * n_rejected / n_total:.1f}% rejected)")
     return kept

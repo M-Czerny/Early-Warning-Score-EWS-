@@ -107,6 +107,20 @@ Diagnostic plots are saved to a timestamped folder under `plots/`, including:
 - SQI metric distributions and Bland-Altman agreement plots
 - Per-LED-combination RMSE comparison
 
+### 10. Export window features (`export.py → export_windows_csv`)
+
+`window_features.csv` is written into the same run folder as the plots. It has
+one row per extracted window and one column per feature, plus:
+
+- `passed_sqi` — whether the window survived the SQI filter
+- `composite_sqi` — composite quality score, normalised to [0, 1] over the full
+  pre-SQI population (same scale as `SQI_COMPOSITE_MIN`)
+
+The table is a superset of what the regressors receive, so filtering
+`passed_sqi == True` and selecting a combination's columns (see `LED_COMBOS` /
+`LED_COMBOS_ACDC` in `calibration.py`) reproduces its exact feature matrix.
+Empty cells are NaN features — those rows are dropped before training.
+
 ---
 
 ## Configuration
@@ -123,6 +137,7 @@ All parameters are set at the top of `main.py`. Key ones:
 | `USE_AC_DC` | False | Use raw AC/DC features instead of R values |
 | `USE_KALMAN` | True | Apply Kalman smoothing to predictions |
 | `RUN_BASELINE` | False | Also run without artifact removal / SQI |
+| `EXPORT_CSV` | True | Write the per-window feature table to CSV |
 
 ---
 
@@ -132,7 +147,8 @@ All parameters are set at the top of `main.py`. Key ones:
 python main.py
 ```
 
-Output: RMSE/MAE/R² per model printed to the console, plots saved to `plots/<timestamp>/`.
+Output: RMSE/MAE/R² per model printed to the console; plots and
+`window_features.csv` saved to `plots/<timestamp>/`.
 
 ---
 
@@ -146,3 +162,4 @@ Output: RMSE/MAE/R² per model printed to the console, plots saved to `plots/<ti
 | `data_extraction.py` | Sliding-window feature extraction and SQI filter |
 | `calibration.py` | LOSO cross-validation, Kalman filter, summary tables |
 | `plotting.py` | Diagnostic and results plots |
+| `export.py` | CSV export of the per-window feature table |
