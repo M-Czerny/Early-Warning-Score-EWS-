@@ -1,418 +1,301 @@
 """
-Main pipeline for wearable SpO2 estimation from multi-LED PPG signals.
+SpO2 estimation from a multi-LED PPG wristband.  Run:  python main.py
 
 Steps:
-  1. Load raw PPG (4 LEDs + accelerometer) and reference SpO2 recordings.
-  2. Time-synchronise the two devices.
-  3. (Optional) Savitzky-Golay denoising of the optical channels.
-  4. Remove samples where the reference SpO2 is unreliable.
-  5. Slide a window over each recording and extract features per window.
-  6. Filter out low-quality windows with the Signal Quality Index (SQI).
-  7. Train and evaluate SpO2 regressors (Leave-One-Subject-Out cross-validation).
-  8. Smooth predictions with a Kalman filter.
-  9. Save diagnostic plots.
- 10. Export the per-window feature table to CSV alongside the plots.
+  1. Load the wristband (PPG) and reference oximeter (SpO2) recordings.
+  2. Line up the two devices in time.
+  3. Remove samples where the reference SpO2 is unreliable.
+  4. Smooth the PPG signals (Savitzky-Golay filter).
+  5. Cut the recordings into windows and compute features per window.
+  6. Drop low-quality windows (Signal Quality Index, SQI).
+  7. Train and test SpO2 models (Leave-One-Subject-Out cross-validation).
+  8. Smooth the predictions over time (Kalman filter).
+  9. Save plots and a CSV of all window features to plots/<timestamp>/.
+
+All settings are in the block below.
 """
 
-from signal_acquisition import load_all_subjects
-from preprocessing import synchronise, remove_artifacts, apply_savgol
-from data_extraction import (extract_windows, apply_sqi,
-                             fit_composite_sqi_scaler, apply_composite_sqi_fitted)
 import copy
+import os
+from typing import Any, Dict
 
-from calibration import (summarise,
-                         calibrate_all_combos, summarise_combos,
-                         apply_kalman_to_all_combos,
-                         grid_search_model_params, sweep_kalman_params)
-from plotting import plot_all
+from calibration import (apply_kalman_to_all_combos, best_rmse, calibrate_all_combos,
+                         grid_search_model_params, summarise, summarise_combos,
+                         sweep_kalman_params)
+from data_extraction import extract_windows
 from export import export_windows_csv
+from plotting import plot_all
+from preprocessing import apply_savgol, remove_artifacts, synchronise
+from signal_acquisition import load_all_subjects
+from sqi import (apply_baseline_sqi, apply_composite_sqi, apply_sqi,
+                 composite_percentile_threshold, fit_composite_sqi_scaler,
+                 percentile_thresholds, report_hr_agreement, report_percentile_overlap)
 
-DATA_DIR = r'C:\EWS\prototype_data'
+# =============================================================================
+# Settings
+# =============================================================================
 
-# --- Artifact-removal thresholds --------------------------------------------
-MIN_SPO2  = 90.0  # drop samples where SpO2 (%) is at or below this
-SPO2_DROP = 2.0   # drop samples where SpO2 drops this many % in one step
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prototype_data')
 
-# --- Window parameters ------------------------------------------------------
-WINDOW_S  = 10.0   # window length in seconds
-OVERLAP   = 0.75   # fraction of overlap between successive windows (0 – <1)
+# --- Artifact removal (based on the reference SpO2) --------------------------
+MIN_SPO2  = 90.0   # drop samples where SpO2 (%) is at or below this
+SPO2_DROP = 3.0    # drop samples where SpO2 falls by this many % in one step
 
-# --- Bandpass / lowpass cut-off frequencies (Hz) ----------------------------
-# These split each PPG channel into its pulsatile AC part (cardiac band) and
-# its slowly-varying DC baseline.
-BP_LOW    = 0.5    # low cut-off  (also used as lowpass cut-off for DC)
-BP_HIGH   = 6.0    # high cut-off
+# --- Windows -----------------------------------------------------------------
+WINDOW_S = 10.0    # window length (s)
+OVERLAP  = 0.75    # overlap between consecutive windows (0 = none)
 
-# --- SQI mode ---------------------------------------------------------------
-# True  → use a single composite SQI score (weighted combination of metrics)
-# False → use individual per-metric thresholds (see below)
-USE_COMPOSITE_SQI    = False
-#SQI_COMPOSITE_MIN    = 0.25   # normalised score in [0, 1]; retains top (1-min)*100 %
-SQI_COMPOSITE_MIN    = 0.4500400589599263  # youden-threshold
+# --- Filters -----------------------------------------------------------------
+BP_LOW  = 0.5      # Hz. Pulse (AC) band is BP_LOW..BP_HIGH, baseline (DC) is below BP_LOW
+BP_HIGH = 6.0
 
-# When USE_COMPOSITE_SQI=False: apply spectral metrics (skewness, kurtosis,
-# SNR, entropy, rel_power) to IR channel only, matching the single-channel
-# ROC analysis used to derive the Youden thresholds.
-SQI_IR_ONLY_METRICS  = False
+USE_SAVGOL       = True   # smooth the PPG channels before feature extraction
+SAVGOL_WINDOW    = 15     # samples, must be odd (15 samples = 300 ms at 50 Hz)
+SAVGOL_POLYORDER = 2
 
-# --- Diagnostic threshold sweep ---------------------------------------------
-# Set True for a one-shot run that prints threshold→RMSE for all candidates
-# and exits without producing plots.  Useful for finding the RMSE-optimal
-# threshold before committing to a value in SQI_COMPOSITE_MIN.
-DIAG_SQI_SWEEP       = False
-DIAG_THRESHOLDS      = [0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7]
+# --- Signal quality (SQI) filter ---------------------------------------------
+# How the quality limits are set (details in sqi.py):
+#   'baseline'   compare each window with the first SQI_BASELINE_S seconds of
+#                its own recording (default)
+#   'fixed'      use the fixed limits from the literature below
+#   'percentile' drop the worst SQI_REJECT_PCT % of windows on each metric
+SQI_THRESHOLD_MODE       = 'baseline'
+SQI_BASELINE_S           = 60.0   # length of the calibration phase (s)
+SQI_BASELINE_K           = 3.0    # how many robust SDs a value may move (3 = lenient)
+SQI_BASELINE_INDEPENDENT = False  # True: calibrate on non-overlapping windows only
+SQI_REJECT_PCT           = 6      # for 'percentile' mode
+SQI_IR_ONLY_METRICS      = False  # True: check per-LED metrics on the IR channel only
 
-# --- Hyperparameter tuning --------------------------------------------------
-# Each flag runs a sweep after the normal SQI filter step and prints a sorted
-# table.  The normal pipeline still runs afterwards (tuning does not exit).
-# Set a flag to True, run once, read the best values from the table, then
-# copy them into the corresponding config constants above and set back to False.
-TUNE_MODEL_PARAMS  = False   # SVR (C, epsilon) and GPR (alpha) grid search
-TUNE_KALMAN        = False   # Kalman Q × R × sigma sweep (uses pre-Kalman preds)
-TUNE_SAVGOL        = False   # Savitzky-Golay window × polyorder sweep
+# Use one weighted quality score instead of the per-metric limits.
+USE_COMPOSITE_SQI = False
+SQI_COMPOSITE_MIN = 0.25          # keep windows with a score (0..1) of at least this
 
-# Candidate grids (only read when the matching TUNE flag is True).
-TUNE_SVR_C         = [0.1, 1.0, 10.0, 100.0, 500.0]
-TUNE_SVR_EPSILON   = [0.01, 0.1, 0.5, 1.0]
-TUNE_GPR_ALPHA     = [0.001, 0.01, 0.1, 0.5, 1.0, 2.0]
-TUNE_KALMAN_Q      = [0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
-TUNE_KALMAN_R      = [0.5, 1.0, 2.0, 5.0, 10.0]
-TUNE_KALMAN_SIGMA  = [2.0, 3.0, 4.0, 5.0]
-TUNE_SAVGOL_WIN    = [7, 11, 15, 21, 31]      # must be odd; auto-incremented if even
-TUNE_SAVGOL_POLY   = [2, 3]                   # polynomial order (must be < window)
+# Fixed limits for 'fixed' mode (None = no limit).  They come from the papers
+# and were found on other sensors, so they are a reference point only.
+SQI_FIXED_LIMITS = dict(
+    skewness_min = 0.0,     # Elgendi 2016
+    kurtosis_max = 3.5,     # Selvaraj 2011
+    snr_min      = 0.0,     # de Haan 2013: below 0 dB the pulse rate is unreliable
+    entropy_min  = 0.8,     # Selvaraj 2011
+    acc_std_max  = 100,     # movement; a still window is about 50-80
+)
 
-# --- SQI thresholds (None = no bound on that side) --------------------------
-# Note: SNR here is computed in the cardiac band vs. residual; because the PPG
-#       DC component is very large, values are typically negative (-20 to +8 dB).
-#       Set snr_min conservatively or leave as None until signal characteristics
-#       are better understood.
-SQI_PI_MIN           = 0.001   # minimum perfusion index (AC/DC of IR channel)
-#SQI_PI_MIN           = 0.01499426068129607 # youden-threshold
-SQI_PI_MAX           = None
-#SQI_SKEWNESS_MIN     =  -2.0   # waveform shape bounds (bandpass signal)
-#SQI_SKEWNESS_MAX     =  2.0
-SQI_SKEWNESS_MIN     =  -1.8838607533911418 # youden-threshold
-SQI_SKEWNESS_MAX     =  1.8838607533911418
-SQI_KURTOSIS_MIN     = -2.0
-SQI_KURTOSIS_MAX     = 10.0    # p99 ≈ 14; 10 retains ~95 % of windows
-#SQI_KURTOSIS_MIN     = -1.7230888300092866
-#SQI_KURTOSIS_MAX     = 6.929752895833283
-SQI_SNR_MIN          = -20.0   # dB; typical range is −22 to +8 dB
-#SQI_SNR_MIN          = -11.319350470854252 # youden-threshold
-SQI_SNR_MAX          = None
-SQI_ENTROPY_MIN      = None 
-SQI_ENTROPY_MAX      =  4.5    # bits  (lower = more concentrated spectrum = better)
-#SQI_ENTROPY_MAX      =  3.037512586042237 # youden-threshold
-SQI_REL_POWER_MIN    =  0.05   # fraction of power in cardiac band; p5 IR ≈ 0.05
-#SQI_REL_POWER_MIN    =  0.3842735801590486 # youden-threshold
-SQI_REL_POWER_MAX    = None
-SQI_ACC_STD_MAX      = 100    # std-dev of acceleration L2-norm; quiet window ≈ 100–220
-#SQI_ACC_STD_MAX      = 87.35546614091636  # youden-threshold; rejects motion artefacts
+# --- Calibration -------------------------------------------------------------
+# LED combinations to test.  None = all 11:
+#   'Red-IR', 'Red-Green', 'Red-Blue', 'IR-Green', 'IR-Blue', 'Green-Blue',
+#   'Red-IR-Green', 'Red-IR-Blue', 'Red-Green-Blue', 'IR-Green-Blue', 'All-4LEDs'
+LED_COMBOS_INCLUDE = None
 
-# --- CSV export of the per-window feature table ------------------------------
-# Writes one row per extracted window (all features, the reference SpO2 target,
-# and the SQI outcome) next to the plots of the same run.
-EXPORT_CSV      = True
-EXPORT_CSV_NAME = 'window_features.csv'
+# Model inputs:
+#   'R'           ratio of ratios
+#   'AC_DC'       AC and DC of each LED
+#   'AC_DC_RATIO' AC/DC of each LED
+FEATURE_MODE = 'R'
 
-# --- Baseline calibration (raw windows, no artifact removal / SQI) ----------
-# Enable to compare the full pipeline against an unfiltered baseline.
-RUN_BASELINE = False
+RANDOM_SEED = 42
 
-# --- LED combination selection ----------------------------------------------
-# None → run all 11 combinations defined in calibration.LED_COMBOS
-# List → run only the named subsets, e.g. ['Red-IR', 'IR-Green', 'All-4LEDs']
-# Valid names: 'Red-IR', 'Red-Green', 'Red-Blue', 'IR-Green', 'IR-Blue',
-#              'Green-Blue', 'Red-IR-Green', 'Red-IR-Blue', 'Red-Green-Blue',
-#              'IR-Green-Blue', 'All-4LEDs'
-LED_COMBOS_INCLUDE = ['Red-IR-Green']
+# SVR and GPR settings per feature mode, found with TUNE_MODEL_PARAMS.
+#   svr_C       higher = follows the training data more closely
+#   svr_epsilon errors smaller than this (% SpO2) are ignored
+#   svr_gamma   width of the SVR kernel
+#   gpr_alpha   higher = smoother fit
+MODEL_PARAMS: Dict[str, Dict[str, Any]] = {
+    'R':           dict(svr_C=0.1,   svr_epsilon=1.0,  svr_gamma='scale', gpr_alpha=2.0),
+    'AC_DC':       dict(svr_C=100.0, svr_epsilon=0.01, svr_gamma='scale', gpr_alpha=0.01),
+    'AC_DC_RATIO': dict(svr_C=100.0, svr_epsilon=0.01, svr_gamma='scale', gpr_alpha=2.0),
+}
+GPR_N_RESTARTS = 5   # more = better GPR fit, but slower
 
-# --- Feature mode -----------------------------------------------------------
-# False (default) → ratio-of-ratios R values as regressor features
-# True            → raw AC (bandpass std) and DC (lowpass mean) per LED channel
-USE_AC_DC = False
+# --- Kalman smoothing of the predictions -------------------------------------
+USE_KALMAN   = True
+KALMAN_Q     = 0.1   # how much SpO2 may change from one window to the next
+KALMAN_R     = 0.5   # how noisy a single prediction is
+KALMAN_SIGMA = 2.0   # ignore predictions further than this many SDs away
 
-# --- Calibration parameters -------------------------------------------------
-RANDOM_SEED = 42   # seed for training-set shuffle in LOSO cross-validation
+# --- Extra runs --------------------------------------------------------------
+RUN_BASELINE = False   # also calibrate on raw windows (no artifact removal, no SQI)
+EXPORT_CSV   = True    # write window_features.csv next to the plots
 
-# --- SVR hyperparameters ----------------------------------------------------
-# For R
-SVR_C       = 0.1    # regularisation: higher = tighter fit, lower = smoother
-SVR_EPSILON = 1      # insensitive tube width in % SpO2; errors within this are ignored
-SVR_GAMMA   = 'scale'  # RBF kernel bandwidth: 'scale', 'auto', or a positive float
+# --- Tuning (print a table of results, then continue as normal) --------------
+# Turn one on, run once, copy the best values into the settings above.
+TUNE_MODEL_PARAMS = False   # SVR (C, epsilon) and GPR alpha
+TUNE_KALMAN       = False   # Kalman Q, R and sigma
+TUNE_SAVGOL       = False   # Savitzky-Golay window and polynomial order
+TUNE_COMPOSITE    = False   # composite SQI cut-off; prints and stops
 
-# For AC & DC
-#SVR_C       = 100.0   
-#SVR_EPSILON = 0.01      
-#SVR_GAMMA   = 'scale'  
+TUNE_SVR_C        = [0.1, 1.0, 10.0, 100.0, 500.0]
+TUNE_SVR_EPSILON  = [0.01, 0.1, 0.5, 1.0]
+TUNE_GPR_ALPHA    = [0.001, 0.01, 0.1, 0.5, 1.0, 2.0]
+TUNE_KALMAN_Q     = [0.1, 0.3, 0.5, 1.0, 2.0, 5.0]
+TUNE_KALMAN_R     = [0.5, 1.0, 2.0, 5.0, 10.0]
+TUNE_KALMAN_SIGMA = [2.0, 3.0, 4.0, 5.0]
+TUNE_SAVGOL_WIN   = [7, 11, 15, 21, 31]
+TUNE_SAVGOL_POLY  = [2, 3]
+# Picking the cut-off with the lowest RMSE makes that RMSE look better than it
+# really is, so treat this table as a rough guide only.
+TUNE_COMPOSITE_MIN = [0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7]
 
-# --- GPR hyperparameters ----------------------------------------------------
-# For R
-GPR_ALPHA      = 2  # noise regularisation: increase (e.g. 0.1–1.0) if GPR overfits noisy windows
-GPR_N_RESTARTS = 5     # kernel optimiser restarts; more = better optimum, slower
 
-# For AC & DC
-#GPR_ALPHA      = 0.01  
-#GPR_N_RESTARTS = 5     
+# =============================================================================
+# Pipeline
+# =============================================================================
 
-# --- Savitzky-Golay denoising (applied to optical PPG channels) -------------
-# Smooths high-frequency noise while preserving waveform shape and amplitude.
-USE_SAVGOL       = True
-SAVGOL_WINDOW    = 15    # samples; must be odd — at 50 Hz, 15 samples = 300 ms
-SAVGOL_POLYORDER = 2     # polynomial order (cubic)
+def calibrate(windows):
+    """LOSO calibration with the settings above."""
+    return calibrate_all_combos(
+        windows, include_combos=LED_COMBOS_INCLUDE, feature_mode=FEATURE_MODE,
+        random_seed=RANDOM_SEED, gpr_n_restarts=GPR_N_RESTARTS,
+        **MODEL_PARAMS[FEATURE_MODE],
+    )
 
-# --- Zero-order Kalman filter on SpO2 predictions ---------------------------
-# Smooths the per-window SpO2 predictions over time and rejects sudden spikes.
-USE_KALMAN      = True
-KALMAN_Q        = 0.1   # process noise variance (expected SpO2 drift per window)
-KALMAN_R        = 0.5   # measurement noise variance (regressor uncertainty)
-KALMAN_SIGMA    = 2.0   # outlier gate: reject prediction if it deviates > this many sigma
+
+def extract(records):
+    return extract_windows(records, window_s=WINDOW_S, overlap=OVERLAP,
+                           bp_low=BP_LOW, bp_high=BP_HIGH)
+
+
+def sqi_limits(windows) -> dict:
+    """The per-metric limits for this run ({} in baseline mode: limits are per recording)."""
+    if SQI_THRESHOLD_MODE == 'baseline':
+        return {}
+    if SQI_THRESHOLD_MODE == 'fixed':
+        return dict(SQI_FIXED_LIMITS)
+    if SQI_THRESHOLD_MODE == 'percentile':
+        return percentile_thresholds(windows, SQI_REJECT_PCT, SQI_IR_ONLY_METRICS)
+    raise ValueError("SQI_THRESHOLD_MODE must be 'baseline', 'fixed' or "
+                     f"'percentile', got {SQI_THRESHOLD_MODE!r}")
+
+
+def composite_min(windows, scaler) -> float:
+    if SQI_THRESHOLD_MODE == 'percentile':
+        return composite_percentile_threshold(windows, SQI_REJECT_PCT, scaler)
+    return SQI_COMPOSITE_MIN
+
+
+def sqi_filter(windows):
+    """Apply the SQI filter chosen in the settings.  Returns (kept, limits used)."""
+    if USE_COMPOSITE_SQI:
+        scaler = fit_composite_sqi_scaler(windows)
+        cut = composite_min(windows, scaler)
+        return apply_composite_sqi(windows, cut, scaler), {'composite_min': cut}
+    if SQI_THRESHOLD_MODE == 'baseline':
+        kept = apply_baseline_sqi(windows, baseline_s=SQI_BASELINE_S, window_s=WINDOW_S,
+                                  k=SQI_BASELINE_K, ir_only=SQI_IR_ONLY_METRICS,
+                                  independent=SQI_BASELINE_INDEPENDENT)
+        return kept, {}
+    limits = sqi_limits(windows)
+    return apply_sqi(windows, limits, ir_only=SQI_IR_ONLY_METRICS), limits
+
+
+def first_combo_rmse(windows) -> float:
+    """Best-model RMSE of the first LED combination (NaN if too few windows)."""
+    if len(windows) < 5:
+        return float('nan')
+    return best_rmse(next(iter(calibrate(windows).values())))
+
+
+def tune_savgol(data_before_savgol) -> None:
+    """Rerun extraction, SQI and calibration for every Savitzky-Golay setting."""
+    print("\n[SavGol tuning]  window × polyorder")
+    print(f"  {'window':>8}  {'polyorder':>10}  {'best_RMSE':>10}")
+    for win in TUNE_SAVGOL_WIN:
+        for poly in TUNE_SAVGOL_POLY:
+            if poly >= win:
+                continue
+            d = copy.deepcopy(data_before_savgol)
+            apply_savgol(d, window_length=win, polyorder=poly)
+            wins, _ = sqi_filter(extract(d))
+            print(f"  {win:>8}  {poly:>10}  {first_combo_rmse(wins):>10.4f}")
+
+
+def tune_composite(windows) -> None:
+    """Print the best RMSE for every composite SQI cut-off."""
+    scaler = fit_composite_sqi_scaler(windows)
+    print(f"\n[Composite tuning]\n  {'cut-off':>10}  {'n_kept':>7}  {'best_RMSE':>10}")
+    for cut in TUNE_COMPOSITE_MIN:
+        kept = apply_composite_sqi(windows, cut, scaler)
+        print(f"  {cut:>10.3f}  {len(kept):>7}  {first_combo_rmse(kept):>10.4f}")
 
 
 def main():
-    # Step 1 — Load raw sensor data from all subject/episode folders.
     print("Loading PPG and SpO2 data...")
     data = load_all_subjects(DATA_DIR)
 
-    # Step 2 — Align PPG and SpO2 time axes (the two devices start independently).
     print("Synchronising signals...")
     data = synchronise(data)
 
-    # --- Optional baseline: calibrate on unfiltered windows for comparison ----
-    combo_results_raw = None
-    results_raw = None
+    # Optional: calibrate on raw windows, to compare with the full pipeline.
+    combo_results_raw = results_raw = None
     if RUN_BASELINE:
-        print("\nExtracting raw windows for baseline comparison...")
-        raw_windows = extract_windows(
-            data,
-            window_s=WINDOW_S,
-            overlap=OVERLAP,
-            bp_low=BP_LOW,
-            bp_high=BP_HIGH,
-        )
-        print(f"  Extracted {len(raw_windows)} raw windows")
-        print("Running baseline calibration (all LED combinations, no preprocessing)...")
-        combo_results_raw = calibrate_all_combos(
-            raw_windows, random_seed=RANDOM_SEED,
-            include_combos=LED_COMBOS_INCLUDE, use_ac_dc=USE_AC_DC,
-            svr_C=SVR_C, svr_epsilon=SVR_EPSILON, svr_gamma=SVR_GAMMA,
-            gpr_alpha=GPR_ALPHA, gpr_n_restarts=GPR_N_RESTARTS,
-        )
+        print("\nCalibrating on raw windows (no artifact removal, no SQI)...")
+        combo_results_raw = calibrate(extract(data))
         if USE_KALMAN:
-            apply_kalman_to_all_combos(combo_results_raw,
-                                       Q=KALMAN_Q, R=KALMAN_R, reject_sigma=KALMAN_SIGMA)
-        _primary = next(iter(combo_results_raw))
-        results_raw = combo_results_raw[_primary]
+            apply_kalman_to_all_combos(combo_results_raw, Q=KALMAN_Q, R=KALMAN_R,
+                                       reject_sigma=KALMAN_SIGMA)
+        results_raw = next(iter(combo_results_raw.values()))
         summarise(results_raw)
 
-    # Step 3 — Remove samples where the reference SpO2 is unreliable
-    #          (e.g. sensor loss, patient movement causing a sudden drop).
     print("\nRemoving artifacts...")
-    data = remove_artifacts(
-        data,
-        min_spo2=MIN_SPO2,
-        spo2_drop=SPO2_DROP,
-    )
+    data = remove_artifacts(data, min_spo2=MIN_SPO2, spo2_drop=SPO2_DROP)
+    data_before_savgol = copy.deepcopy(data) if TUNE_SAVGOL else None
 
-    # Keep a pre-SavGol snapshot so the SavGol sweep can re-filter from scratch.
-    _data_pre_savgol = copy.deepcopy(data) if TUNE_SAVGOL else None
-
-    # Step 4 — Smooth optical channels to reduce high-frequency noise.
     if USE_SAVGOL:
         print("Applying Savitzky-Golay filter to PPG channels...")
         apply_savgol(data, window_length=SAVGOL_WINDOW, polyorder=SAVGOL_POLYORDER)
 
-    # Print a per-recording summary of how many samples were removed.
     print(f"\n  {'Recording':<30}  {'PPG':>8}  {'SpO2':>8}  {'removed':>8}")
     for rec in data:
         label = rec['subject'] + (f" / {rec['episode']}" if rec['episode'] else "")
-        pct = rec['n_ppg_removed'] / (len(rec['ppg']['ir']) + rec['n_ppg_removed']) * 100
-        print(f"  {label:<30}  {len(rec['ppg']['ir']):>8}  "
-              f"{len(rec['spo2']['spo2']):>8}  {pct:>7.1f}%")
+        n_ppg = len(rec['ppg']['ir'])
+        pct = rec['n_ppg_removed'] / (n_ppg + rec['n_ppg_removed']) * 100
+        print(f"  {label:<30}  {n_ppg:>8}  {len(rec['spo2']['spo2']):>8}  {pct:>7.1f}%")
 
-    # Step 5 — Slide a window over each clean recording and compute features.
-    #          Each window yields AC/DC amplitudes, ratio-of-ratios R values,
-    #          and spectral quality metrics for all four LED channels.
     print("\nExtracting windows and features...")
-    all_windows = extract_windows(
-        data,
-        window_s=WINDOW_S,
-        overlap=OVERLAP,
-        bp_low=BP_LOW,
-        bp_high=BP_HIGH,
-    )
+    all_windows = extract(data)
     print(f"  Extracted {len(all_windows)} windows total")
 
-    # Step 6 — Discard windows that are too noisy or motion-corrupted.
-    print("\nApplying SQI filter...")
-
-    # Fit the composite scaler once on the full pre-SQI population so the
-    # threshold value has a stable percentile meaning on every run.
-    _sqi_scaler = fit_composite_sqi_scaler(all_windows)
-
-    if DIAG_SQI_SWEEP:
-        # One-shot diagnostic: print threshold→RMSE for each candidate then exit.
-        print("\n--- Diagnostic SQI threshold sweep ---")
-        print(f"  {'threshold':>10}  {'n_kept':>7}  {'best_RMSE':>10}")
-        for _thr in DIAG_THRESHOLDS:
-            _kept = apply_composite_sqi_fitted(all_windows, _thr, _sqi_scaler)
-            if len(_kept) < 5:
-                print(f"  {_thr:>10.3f}  {len(_kept):>7}  {'(too few)':>10}")
-                continue
-            _cv = calibrate_all_combos(
-                _kept, random_seed=RANDOM_SEED,
-                include_combos=LED_COMBOS_INCLUDE, use_ac_dc=USE_AC_DC,
-                svr_C=SVR_C, svr_epsilon=SVR_EPSILON, svr_gamma=SVR_GAMMA,
-                gpr_alpha=GPR_ALPHA, gpr_n_restarts=GPR_N_RESTARTS,
-            )
-            # _cv: Dict[combo, Dict[model, List[FoldResult]]]
-            _first_combo = next(iter(_cv.values())) if _cv else {}
-            _best = min(
-                sum(f.rmse for f in folds) / len(folds)
-                for folds in _first_combo.values() if folds
-            ) if _first_combo else float('nan')
-            print(f"  {_thr:>10.3f}  {len(_kept):>7}  {_best:>10.4f}")
-        print("--- End of diagnostic sweep. Set DIAG_SQI_SWEEP=False to run normally. ---")
+    if TUNE_COMPOSITE:
+        tune_composite(all_windows)
         return None, None
 
-    if USE_COMPOSITE_SQI:
-        # Single weighted score using pre-fitted scaler for stable threshold semantics.
-        kept_windows = apply_composite_sqi_fitted(
-            all_windows, composite_min=SQI_COMPOSITE_MIN, scaler=_sqi_scaler
-        )
-    else:
-        # Per-metric thresholds — each criterion is checked independently.
-        # ir_only_metrics=SQI_IR_ONLY_METRICS matches the single-channel Youden analysis.
-        kept_windows = apply_sqi(
-            all_windows,
-            pi_min=SQI_PI_MIN,             pi_max=SQI_PI_MAX,
-            skewness_min=SQI_SKEWNESS_MIN, skewness_max=SQI_SKEWNESS_MAX,
-            kurtosis_min=SQI_KURTOSIS_MIN, kurtosis_max=SQI_KURTOSIS_MAX,
-            snr_min=SQI_SNR_MIN,           snr_max=SQI_SNR_MAX,
-            entropy_min=SQI_ENTROPY_MIN,   entropy_max=SQI_ENTROPY_MAX,
-            rel_power_min=SQI_REL_POWER_MIN, rel_power_max=SQI_REL_POWER_MAX,
-            acc_std_max=SQI_ACC_STD_MAX,
-            ir_only_metrics=SQI_IR_ONLY_METRICS,
-        )
-
+    print("\nApplying SQI filter...")
+    kept_windows, limits = sqi_filter(all_windows)
+    if SQI_THRESHOLD_MODE == 'percentile' and not USE_COMPOSITE_SQI:
+        report_percentile_overlap(all_windows, limits, SQI_IR_ONLY_METRICS)
+    report_hr_agreement(all_windows, kept_windows)
     print(f"\nDone — {len(kept_windows)} windows ready for analysis.")
 
-    # --- Optional: model hyperparameter sweep --------------------------------
     if TUNE_MODEL_PARAMS:
         grid_search_model_params(
-            kept_windows,
-            svr_C_grid=TUNE_SVR_C,       svr_epsilon_grid=TUNE_SVR_EPSILON,
-            gpr_alpha_grid=TUNE_GPR_ALPHA,
-            random_seed=RANDOM_SEED,
-            include_combos=LED_COMBOS_INCLUDE, use_ac_dc=USE_AC_DC,
-            svr_gamma=SVR_GAMMA,         gpr_n_restarts=GPR_N_RESTARTS,
+            kept_windows, TUNE_SVR_C, TUNE_SVR_EPSILON, TUNE_GPR_ALPHA,
+            include_combos=LED_COMBOS_INCLUDE, feature_mode=FEATURE_MODE,
+            random_seed=RANDOM_SEED, gpr_n_restarts=GPR_N_RESTARTS,
+            svr_gamma=MODEL_PARAMS[FEATURE_MODE]['svr_gamma'],
         )
+    if TUNE_SAVGOL:
+        tune_savgol(data_before_savgol)
 
-    # --- Optional: SavGol sweep (re-extracts windows for each setting) -------
-    if TUNE_SAVGOL and _data_pre_savgol is not None:
-        print("\n[SavGol tuning]  window × polyorder")
-        print(f"  {'window':>8}  {'polyorder':>10}  {'best_RMSE':>10}")
-        _sg_rows = []
-        for _win in TUNE_SAVGOL_WIN:
-            for _poly in TUNE_SAVGOL_POLY:
-                if _poly >= _win:
-                    continue
-                _d = copy.deepcopy(_data_pre_savgol)
-                apply_savgol(_d, window_length=_win, polyorder=_poly)
-                _wins = extract_windows(_d, window_s=WINDOW_S, overlap=OVERLAP,
-                                        bp_low=BP_LOW, bp_high=BP_HIGH)
-                _sc = fit_composite_sqi_scaler(_wins)
-                if USE_COMPOSITE_SQI:
-                    _wins = apply_composite_sqi_fitted(_wins, SQI_COMPOSITE_MIN, _sc)
-                else:
-                    _wins = apply_sqi(
-                        _wins,
-                        pi_min=SQI_PI_MIN,             pi_max=SQI_PI_MAX,
-                        skewness_min=SQI_SKEWNESS_MIN, skewness_max=SQI_SKEWNESS_MAX,
-                        kurtosis_min=SQI_KURTOSIS_MIN, kurtosis_max=SQI_KURTOSIS_MAX,
-                        snr_min=SQI_SNR_MIN,           snr_max=SQI_SNR_MAX,
-                        entropy_min=SQI_ENTROPY_MIN,   entropy_max=SQI_ENTROPY_MAX,
-                        rel_power_min=SQI_REL_POWER_MIN, rel_power_max=SQI_REL_POWER_MAX,
-                        acc_std_max=SQI_ACC_STD_MAX,   ir_only_metrics=SQI_IR_ONLY_METRICS,
-                    )
-                if len(_wins) < 5:
-                    print(f"  {_win:>8}  {_poly:>10}  {'(too few)':>10}")
-                    continue
-                _cv = calibrate_all_combos(
-                    _wins, random_seed=RANDOM_SEED,
-                    include_combos=LED_COMBOS_INCLUDE, use_ac_dc=USE_AC_DC,
-                    svr_C=SVR_C, svr_epsilon=SVR_EPSILON, svr_gamma=SVR_GAMMA,
-                    gpr_alpha=GPR_ALPHA, gpr_n_restarts=GPR_N_RESTARTS,
-                )
-                _first = next(iter(_cv.values())) if _cv else {}
-                _best = min(
-                    sum(f.rmse for f in folds) / len(folds)
-                    for folds in _first.values() if folds
-                ) if _first else float('nan')
-                _sg_rows.append({'window': _win, 'polyorder': _poly, 'rmse': _best})
-                print(f"  {_win:>8}  {_poly:>10}  {_best:>10.4f}")
-        if _sg_rows:
-            _sg_rows.sort(key=lambda r: r['rmse'])
-            _b = _sg_rows[0]
-            print(f"  → best: window={_b['window']}, polyorder={_b['polyorder']}, "
-                  f"RMSE={_b['rmse']:.4f}")
-
-    # Step 7 — Train regressors (Linear, Quadratic, SVR, GPR, DecisionTree)
-    #          using Leave-One-Subject-Out cross-validation, then smooth
-    #          per-window predictions with a Kalman filter.
-    print("\nRunning calibration (all LED combinations, Leave-One-Subject-Out)...")
-    combo_results = calibrate_all_combos(
-        kept_windows, random_seed=RANDOM_SEED,
-        include_combos=LED_COMBOS_INCLUDE, use_ac_dc=USE_AC_DC,
-        svr_C=SVR_C, svr_epsilon=SVR_EPSILON, svr_gamma=SVR_GAMMA,
-        gpr_alpha=GPR_ALPHA, gpr_n_restarts=GPR_N_RESTARTS,
-    )
-    # --- Optional: Kalman parameter sweep (uses raw, pre-Kalman predictions) --
+    print("\nRunning calibration (Leave-One-Subject-Out)...")
+    combo_results = calibrate(kept_windows)
     if TUNE_KALMAN:
-        sweep_kalman_params(
-            combo_results,
-            Q_grid=TUNE_KALMAN_Q, R_grid=TUNE_KALMAN_R, sigma_grid=TUNE_KALMAN_SIGMA,
-        )
-
+        sweep_kalman_params(combo_results, TUNE_KALMAN_Q, TUNE_KALMAN_R, TUNE_KALMAN_SIGMA)
     if USE_KALMAN:
-        # Step 8 — Post-process: smooth SpO2 predictions over time per subject.
-        apply_kalman_to_all_combos(combo_results,
-                                   Q=KALMAN_Q, R=KALMAN_R, reject_sigma=KALMAN_SIGMA)
-    _primary = next(iter(combo_results))
-    results = combo_results[_primary]
+        apply_kalman_to_all_combos(combo_results, Q=KALMAN_Q, R=KALMAN_R,
+                                   reject_sigma=KALMAN_SIGMA)
+    results = next(iter(combo_results.values()))
     summarise(results)
     summarise_combos(combo_results)
 
-    sqi_params = dict(
-        pi_min=SQI_PI_MIN,               pi_max=SQI_PI_MAX,
-        skewness_min=SQI_SKEWNESS_MIN,   skewness_max=SQI_SKEWNESS_MAX,
-        kurtosis_min=SQI_KURTOSIS_MIN,   kurtosis_max=SQI_KURTOSIS_MAX,
-        snr_min=SQI_SNR_MIN,             snr_max=SQI_SNR_MAX,
-        entropy_min=SQI_ENTROPY_MIN,     entropy_max=SQI_ENTROPY_MAX,
-        rel_power_min=SQI_REL_POWER_MIN, rel_power_max=SQI_REL_POWER_MAX,
-        acc_std_max=SQI_ACC_STD_MAX,
-        composite_min=SQI_COMPOSITE_MIN if USE_COMPOSITE_SQI else None,
-    )
-
     out_dir = plot_all(
-        records=data,
-        all_windows=all_windows,
-        kept_windows=kept_windows,
-        results=results,
-        results_raw=results_raw,
-        sqi_params=sqi_params,
-        combo_results=combo_results,
-        combo_results_raw=combo_results_raw,
-        window_s=WINDOW_S,
-        bp_low=BP_LOW,
-        bp_high=BP_HIGH,
+        records=data, all_windows=all_windows, kept_windows=kept_windows,
+        results=results, results_raw=results_raw, sqi_limits=limits,
+        combo_results=combo_results, combo_results_raw=combo_results_raw,
+        window_s=WINDOW_S, bp_low=BP_LOW, bp_high=BP_HIGH,
     )
 
-    # Step 9 — Write the per-window feature table alongside the plots.
     if EXPORT_CSV:
         print('\nExporting window features...')
-        export_windows_csv(all_windows, kept_windows, out_dir,
-                           filename=EXPORT_CSV_NAME)
+        export_windows_csv(all_windows, kept_windows, out_dir)
 
     return kept_windows, results
 

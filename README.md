@@ -1,165 +1,150 @@
-# EWS — Wearable SpO2 Estimation Pipeline
+# EWS: SpO2 estimation from a wearable PPG sensor
 
-This project estimates blood oxygen saturation (SpO2) from a multi-LED PPG
-(photoplethysmography) prototype sensor. A reference pulse oximeter provides
-the ground-truth SpO2 values used for training and evaluation.
+This project estimates blood oxygen saturation (SpO2) from a wristband
+prototype with four LEDs (red, infrared, green, blue). A reference pulse
+oximeter is worn at the same time and provides the true SpO2 values used to
+train and test the models.
 
----
-
-## How the pipeline works
-
-```
-Raw data  →  Synchronise  →  Denoise  →  Remove artifacts
-          →  Extract windows  →  SQI filter  →  Calibrate  →  Kalman filter  →  Plots
-```
-
-### 1. Load data (`signal_acquisition.py`)
-
-The pipeline reads two files per recording session from `prototype_data/`:
-
-| File | Device | Contents |
-|------|--------|----------|
-| `<timestamp>.txt` | Prototype wristband | IR, Red, Green, Blue PPG + 3-axis accelerometer at **50 Hz** |
-| `opensignals_*.txt` | Reference pulse oximeter | SpO2 (%), Red, IR at **100 Hz** |
-
-Both flat (`subject1/<files>`) and nested (`subject1/episode 1/<files>`) folder layouts are supported.
-
-### 2. Synchronise (`preprocessing.py → synchronise`)
-
-The two devices start independently, so their recordings need to be aligned.
-The prototype encodes its start time in the filename (Unix milliseconds).
-The reference device stores its start time in a JSON header.  The earlier
-signal is trimmed to match the start of the later one.
-
-### 3. Denoise (`preprocessing.py → apply_savgol`)
-
-A **Savitzky-Golay filter** smooths the four optical channels.  It fits a
-polynomial through a short sliding window, removing high-frequency noise while
-preserving the waveform shape better than a plain moving average.
-
-### 4. Remove artifacts (`preprocessing.py → remove_artifacts`)
-
-Reference SpO2 samples are flagged as bad when:
-- SpO2 ≤ `MIN_SPO2` (90%) — probe loss or very low saturation
-- SpO2 drops ≥ `SPO2_DROP` (3%) in a single step — sudden probe-off event
-
-The same time windows are removed from the PPG data.  Motion artefacts are
-handled later at the window level by the SQI filter.
-
-### 5. Extract windows and features (`data_extraction.py → extract_windows`)
-
-A sliding window (default: 10 s, 75% overlap) passes over each clean recording.
-For every window the following features are computed for all four LED channels:
-
-- **AC amplitude**: standard deviation of the bandpass-filtered signal (0.5–6 Hz).
-  This captures the pulsatile component driven by the cardiac cycle.
-- **DC amplitude**: mean of the lowpass-filtered signal (< 0.5 Hz).
-  This is the slow-varying tissue absorption baseline.
-- **Ratio-of-ratios R** = (AC_A / DC_A) / (AC_B / DC_B) for every LED pair.
-  R is the key SpO2 feature: it cancels tissue and path-length differences
-  between subjects and relates monotonically to SpO2.
-- **Signal quality metrics**: perfusion index (PI = AC/DC of IR), SNR,
-  skewness, kurtosis, spectral entropy, relative cardiac-band power.
-- **Motion metric**: standard deviation of the accelerometer L2-norm.
-
-### 6. SQI filter (`data_extraction.py → apply_sqi / apply_composite_sqi`)
-
-The **Signal Quality Index** discards windows that are too noisy or corrupted
-by motion. Two modes are available:
-
-- **Per-metric** (`USE_COMPOSITE_SQI = False`): each quality metric is checked
-  against an independent threshold. A window is discarded if any metric fails.
-- **Composite** (`USE_COMPOSITE_SQI = True`): a single weighted score combines
-  all metrics; windows below `SQI_COMPOSITE_MIN` are discarded.
-
-### 7. Calibrate (`calibration.py → calibrate_all_combos`)
-
-Five regression models are trained and evaluated using
-**Leave-One-Subject-Out (LOSO) cross-validation**:
-
-| Model | Notes |
-|-------|-------|
-| Linear | Straight-line R → SpO2 mapping |
-| Quadratic | Second-order polynomial |
-| SVR | Support Vector Regression with RBF kernel |
-| GPR | Gaussian Process Regression (also gives uncertainty) |
-| DecisionTree | Decision tree, max depth 5 |
-
-In each fold, one subject is held out for testing and all other subjects are
-used for training.  This gives a realistic estimate of how well the model
-generalises to a new individual.
-
-For LED pair combinations, both the forward R (e.g. Red/IR) and its inverse
-(IR/Red) are evaluated and the better-performing direction is kept.
-
-### 8. Kalman filter (`calibration.py → apply_kalman_to_all_combos`)
-
-A **zero-order Kalman filter** is applied per subject to the sequence of
-per-window SpO2 predictions. It assumes SpO2 changes slowly between windows
-and rejects sudden prediction spikes (outliers) while allowing genuine
-sustained changes to pass through after a short lag.
-
-### 9. Plot results (`plotting.py → plot_all`)
-
-Diagnostic plots are saved to a timestamped folder under `plots/`, including:
-- Raw and cleaned PPG traces with artifact regions highlighted
-- Scatter and time-series plots of predicted vs. reference SpO2
-- SQI metric distributions and Bland-Altman agreement plots
-- Per-LED-combination RMSE comparison
-
-### 10. Export window features (`export.py → export_windows_csv`)
-
-`window_features.csv` is written into the same run folder as the plots. It has
-one row per extracted window and one column per feature, plus:
-
-- `passed_sqi` — whether the window survived the SQI filter
-- `composite_sqi` — composite quality score, normalised to [0, 1] over the full
-  pre-SQI population (same scale as `SQI_COMPOSITE_MIN`)
-
-The table is a superset of what the regressors receive, so filtering
-`passed_sqi == True` and selecting a combination's columns (see `LED_COMBOS` /
-`LED_COMBOS_ACDC` in `calibration.py`) reproduces its exact feature matrix.
-Empty cells are NaN features — those rows are dropped before training.
-
----
-
-## Configuration
-
-All parameters are set at the top of `main.py`. Key ones:
-
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `WINDOW_S` | 10.0 s | Window length |
-| `OVERLAP` | 0.75 | Fraction of overlap between windows |
-| `USE_SAVGOL` | True | Apply Savitzky-Golay denoising |
-| `USE_COMPOSITE_SQI` | False | Use composite vs. per-metric SQI |
-| `LED_COMBOS_INCLUDE` | `['Red-IR']` | Which LED pairs to calibrate |
-| `USE_AC_DC` | False | Use raw AC/DC features instead of R values |
-| `USE_KALMAN` | True | Apply Kalman smoothing to predictions |
-| `RUN_BASELINE` | False | Also run without artifact removal / SQI |
-| `EXPORT_CSV` | True | Write the per-window feature table to CSV |
-
----
-
-## Running
+## Quick start
 
 ```bash
-python main.py
+python -m venv EWSvenv
+EWSvenv\Scripts\activate          # on macOS/Linux: source EWSvenv/bin/activate
+pip install -r requirements.txt
+python main.py                    # takes about 5 minutes
+python test_sqi.py                # quick self-checks
+python test_calibration.py
 ```
 
-Output: RMSE/MAE/R² per model printed to the console; plots and
-`window_features.csv` saved to `plots/<timestamp>/`.
+The console shows the error (RMSE, MAE, R², bias) of every model. Plots and a
+CSV of all window features are saved in `plots/<date_time>/`.
 
----
+## How it works
 
-## File overview
+```
+load → synchronise → remove artifacts → smooth → windows + features
+     → quality filter (SQI) → train/test models (LOSO) → Kalman smoothing → plots + CSV
+```
+
+| Step | File | What happens |
+|------|------|--------------|
+| 1. Load | `signal_acquisition.py` | Reads the two files of each recording from `prototype_data/`. |
+| 2. Synchronise | `preprocessing.py` | The two devices start at different times. The earlier recording is cut so both start together. |
+| 3. Remove artifacts | `preprocessing.py` | Drops moments where the reference SpO2 is at or below 90 %, or falls by 3 % or more in one step (probe slipped). |
+| 4. Smooth | `preprocessing.py` | Savitzky-Golay filter on the four LED channels to remove fast noise. |
+| 5. Features | `data_extraction.py` | Cuts each recording into 10 s windows (75 % overlap) and computes AC, DC, ratio of ratios R and quality metrics for every LED. |
+| 6. Quality filter | `sqi.py` | Drops windows with a poor signal (see below). |
+| 7. Calibrate | `calibration.py` | Trains five models (Linear, Quadratic, SVR, GPR, Decision Tree) with Leave-One-Subject-Out cross-validation. |
+| 8. Kalman | `calibration.py` | Smooths each subject's predictions over time and ignores sudden jumps. |
+| 9. Output | `plotting.py`, `export.py` | Saves the plots and `window_features.csv`. |
+
+### Features
+
+For each window and LED:
+
+- **AC**: size of the pulse (standard deviation of the 0.5 to 6 Hz bandpassed signal)
+- **DC**: baseline light level (mean of the signal below 0.5 Hz)
+- **R** = (AC_a / DC_a) / (AC_b / DC_b) for every LED pair. This is the classic
+  pulse oximetry feature. Each pair is tried both ways round (for example
+  Red/IR and IR/Red) and the better direction is kept.
+
+`FEATURE_MODE` in `main.py` chooses what the models get: `'R'`, `'AC_DC'`
+(AC and DC of each LED) or `'AC_DC_RATIO'` (AC/DC of each LED).
+
+### Quality filter (SQI)
+
+Every window gets seven quality metrics, each taken from the literature:
+
+| Metric | Source | Poor quality when |
+|--------|--------|-------------------|
+| Perfusion | Elgendi 2016 | too low or too high |
+| Skewness | Elgendi 2016 | too low |
+| Kurtosis | Selvaraj 2011 | too high |
+| SNR around the heart rate | de Haan 2013 | too low |
+| Shannon entropy | Selvaraj 2011 | too low |
+| Relative power in the pulse band | Elgendi 2016 | too low |
+| Accelerometer movement | | too high |
+
+`SQI_THRESHOLD_MODE` in `main.py` chooses how the limits are set:
+
+- `'baseline'` (default): the first 60 s of each recording act as a
+  calibration phase. A window is dropped when a metric moves more than 3 robust
+  standard deviations (median and MAD, Leys 2013) away from that person's own
+  calibration values. This works better than fixed limits because the metrics
+  differ a lot between people even when the signal is clean.
+- `'fixed'`: fixed limits from the papers (`SQI_FIXED_LIMITS`).
+- `'percentile'`: drop the worst `SQI_REJECT_PCT` % of windows on each metric.
+- `USE_COMPOSITE_SQI = True`: one weighted score instead of seven limits.
+
+As a check, each run prints how often the heart rate of kept and of dropped
+windows agrees with the reference oximeter. The filter never sees the
+reference, so this is an independent test.
+
+### Leave-One-Subject-Out (LOSO)
+
+Each subject in turn is held out. The models are trained on all the other
+subjects and tested on the held-out one. This shows how well a model works on a
+person it has never seen.
+
+## Settings
+
+All settings are at the top of `main.py`. The most useful ones:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `WINDOW_S`, `OVERLAP` | 10 s, 0.75 | window length and overlap |
+| `SQI_THRESHOLD_MODE` | `'baseline'` | how the quality limits are set |
+| `LED_COMBOS_INCLUDE` | `None` (all 11) | which LED combinations to test, e.g. `['Red-IR']` |
+| `FEATURE_MODE` | `'R'` | model inputs |
+| `USE_SAVGOL`, `USE_KALMAN` | `True` | turn the smoothing steps on or off |
+| `RUN_BASELINE` | `False` | also train on raw windows, for comparison |
+| `TUNE_*` | `False` | print tuning tables for the model, Kalman, Savitzky-Golay or composite settings |
+
+## Data layout
+
+```
+prototype_data/
+  subject5/
+    1775057212809.txt               wristband: IR, Red, Green, Blue, ACCx/y/z at 50 Hz
+                                    (file name = start time in Unix ms)
+    opensignals_<...>.txt           reference oximeter: Red, IR, SpO2 at 100 Hz
+  subject9/
+    episode 2/                      a subject can also have one folder per recording
+      ...
+```
+
+## Output
+
+Each run creates `plots/<date_time>/` with:
+
+| File | Content |
+|------|---------|
+| `01_signals_<subject>.png` | raw signals, removed artifacts and dropped windows |
+| `02_predictions_<subject>.png` | predicted vs reference SpO2 |
+| `03_bland_altman.png` | agreement of the best model with the reference |
+| `04_bias_per_subject.png` | mean error per subject and model |
+| `05_sqi_overview.png` | every quality metric for every window |
+| `06_rmse_<combo>.png` | RMSE of each model for one LED combination |
+| `07_residuals.png` | distribution of prediction errors |
+| `window_features.csv` | one row per window with all features and `passed_sqi` |
+
+## Files
 
 | File | Role |
 |------|------|
-| `main.py` | Entry point; configuration and pipeline orchestration |
-| `signal_acquisition.py` | Discover and load raw data files |
-| `preprocessing.py` | Synchronise clocks, denoise, remove bad samples |
-| `data_extraction.py` | Sliding-window feature extraction and SQI filter |
-| `calibration.py` | LOSO cross-validation, Kalman filter, summary tables |
-| `plotting.py` | Diagnostic and results plots |
-| `export.py` | CSV export of the per-window feature table |
+| `main.py` | settings and the pipeline, start here |
+| `signal_acquisition.py` | find and read the data files |
+| `preprocessing.py` | synchronise, remove artifacts, smooth |
+| `data_extraction.py` | windows, features and quality metrics |
+| `sqi.py` | the quality filters |
+| `calibration.py` | models, LOSO cross-validation, Kalman filter, tuning |
+| `plotting.py` | plots |
+| `export.py` | CSV export |
+| `test_sqi.py`, `test_calibration.py` | self-checks, run with `python <file>` |
+
+## References
+
+- Elgendi M. (2016). Optimal signal quality index for photoplethysmogram signals. *Bioengineering* 3(4):21.
+- Selvaraj N. et al. (2011). Statistical approach for the detection of motion/noise artifacts in photoplethysmogram. *IEEE EMBC*.
+- de Haan G., Jeanne V. (2013). Robust pulse rate from chrominance-based rPPG. *IEEE Trans. Biomed. Eng.* 60(10).
+- Leys C. et al. (2013). Detecting outliers: Do not use standard deviation around the mean, use absolute deviation around the median. *J. Exp. Soc. Psychol.* 49(4):764-766.

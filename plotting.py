@@ -1,8 +1,8 @@
 """
-Diagnostic plots for one pipeline run.
+Plots for one pipeline run.
 
-Call plot_all() from main.py.  A timestamped sub-folder is created inside
-`plots/` so successive runs never overwrite each other.
+plot_all() saves every plot into a new folder plots/<date_time>/, so runs
+never overwrite each other.
 """
 from __future__ import annotations
 
@@ -15,9 +15,10 @@ matplotlib.use('Agg')                 # file-only backend
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy import signal as dsp
+from scipy.stats import gaussian_kde
 
-from data_extraction import composite_sqi_score
+from data_extraction import bandpass
+from sqi import METRICS, fit_composite_sqi_scaler, metric_fields, normalised_composite
 
 
 # ---------------------------------------------------------------------------
@@ -28,12 +29,6 @@ def _make_run_dir(base: str = 'plots') -> str:
     path = os.path.join(base, datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(path, exist_ok=True)
     return path
-
-
-def _bandpass(x: np.ndarray, fs: float, low: float, high: float) -> np.ndarray:
-    nyq = fs / 2.0
-    b, a = dsp.butter(4, [low / nyq, high / nyq], btype='band', output='ba')  # type: ignore
-    return dsp.filtfilt(b, a, x)
 
 
 def _bad_time_spans(mask: np.ndarray, fs: float) -> list[tuple[float, float]]:
@@ -89,7 +84,7 @@ def _plot_signals(
         # Bandpass each channel from the pre-removal signal
         def ac(key: str) -> np.ndarray:
             x = orig[key].astype(float)
-            return _bandpass(x, fs, bp_low, bp_high) if len(x) > 3 * win_n else np.zeros(n)
+            return bandpass(x, fs, bp_low, bp_high) if len(x) > 3 * win_n else np.zeros(n)
 
         ac_r = ac('red');   ac_i = ac('ir')
         ac_g = ac('green'); ac_b = ac('blue')
@@ -229,7 +224,7 @@ def _plot_predictions(combo_results: dict, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plot 3 — mean LOSO RMSE per model (with optional raw-baseline comparison)
+# Plot 6 — mean LOSO RMSE per model (with optional raw-baseline comparison)
 # ---------------------------------------------------------------------------
 
 def _annotate_bars(ax, bars, means, stds, fontsize=8):
@@ -246,7 +241,7 @@ def _plot_rmse(
     out_dir:      str,
     results_raw:  Optional[dict] = None,
     title_suffix: str = '',
-    filename:     str = '03_rmse_comparison.png',
+    filename:     str = '06_rmse.png',
 ) -> None:
     names = list(results.keys())
     best  = _best_model_name(results)
@@ -333,33 +328,28 @@ def _plot_rmse_combos(
 # Plot 5 — SQI parameter overview
 # ---------------------------------------------------------------------------
 
-def _plot_sqi(
-    all_windows: list,
-    kept_ids:    set,
-    sqi_params:  dict,
-    out_dir:     str,
-) -> None:
+_SQI_TITLES = {
+    'pi':        'Perfusion Index (PI)',
+    'skewness':  'Skewness',
+    'kurtosis':  'Kurtosis',
+    'snr':       'SNR (dB)',
+    'entropy':   'Shannon Entropy (normalised)',
+    'rel_power': 'Relative Power',
+    'acc_std':   'Acceleration Energy Std-Dev',
+}
+_CH_STYLE = {'red': ('crimson', 'o'), 'ir': ('darkorange', '^'),
+             'green': ('forestgreen', 's'), 'blue': ('royalblue', 'D')}
+
+
+def _plot_sqi(all_windows: list, limits: dict, out_dir: str) -> None:
     """
-    One subplot per SQI metric.  Every window is plotted (x = window index,
-    y = parameter value) in its channel colour: red=crimson, IR=darkorange,
-    green=forestgreen, blue=royalblue.  No kept/rejected distinction is shown.
-    Threshold lines are drawn as dashed (min) or dotted (max) black lines.
-    Each subplot title reports total window count and how many windows fail
-    that criterion alone (across all channels in that metric).
+    One panel per quality metric, with every window as a dot (one colour per
+    LED).  Dashed line = lower limit, dotted line = upper limit.  The title
+    says how many windows fail that metric on its own.
     """
     n = len(all_windows)
     x = np.arange(n)
-    p = sqi_params
-
-    # channel colour map: label → colour
-    CH_COL = {
-        'Red':   'crimson',
-        'IR':    'darkorange',
-        'Green': 'forestgreen',
-        'Blue':  'royalblue',
-        'PI':    'steelblue',
-        'Acc':   'slategrey',
-    }
+    p = limits
 
     def _v(field: str) -> np.ndarray:
         return np.array([getattr(w, field) for w in all_windows])
@@ -372,49 +362,19 @@ def _plot_sqi(
             if hi is not None: bad |= v > hi
         return int(bad.sum())
 
-    specs = [
-        dict(title='Perfusion Index (PI)',        ylabel='PI',
-             lo=p.get('pi_min'),         hi=p.get('pi_max'),
-             channels=[('pi',                'PI',    'o')]),
-        dict(title='Skewness',                    ylabel='skewness',
-             lo=p.get('skewness_min'),   hi=p.get('skewness_max'),
-             channels=[('skewness_red',    'Red',   'o'),
-                        ('skewness_ir',     'IR',    '^'),
-                        ('skewness_green',  'Green', 's'),
-                        ('skewness_blue',   'Blue',  'D')]),
-        dict(title='Kurtosis',                    ylabel='kurtosis',
-             lo=p.get('kurtosis_min'),   hi=p.get('kurtosis_max'),
-             channels=[('kurtosis_red',    'Red',   'o'),
-                        ('kurtosis_ir',     'IR',    '^'),
-                        ('kurtosis_green',  'Green', 's'),
-                        ('kurtosis_blue',   'Blue',  'D')]),
-        dict(title='SNR (dB)',                    ylabel='SNR (dB)',
-             lo=p.get('snr_min'),        hi=p.get('snr_max'),
-             channels=[('snr_red',         'Red',   'o'),
-                        ('snr_ir',          'IR',    '^'),
-                        ('snr_green',       'Green', 's'),
-                        ('snr_blue',        'Blue',  'D')]),
-        dict(title='Spectral Entropy (bits)',     ylabel='entropy',
-             lo=p.get('entropy_min'),    hi=p.get('entropy_max'),
-             channels=[('entropy_red',     'Red',   'o'),
-                        ('entropy_ir',      'IR',    '^'),
-                        ('entropy_green',   'Green', 's'),
-                        ('entropy_blue',    'Blue',  'D')]),
-        dict(title='Relative Power',              ylabel='rel. power',
-             lo=p.get('rel_power_min'),  hi=p.get('rel_power_max'),
-             channels=[('rel_power_red',   'Red',   'o'),
-                        ('rel_power_ir',    'IR',    '^'),
-                        ('rel_power_green', 'Green', 's'),
-                        ('rel_power_blue',  'Blue',  'D')]),
-        dict(title='Acceleration Energy Std-Dev', ylabel='acc std',
-             lo=None,                   hi=p.get('acc_std_max'),
-             channels=[('acc_energy_std',  'Acc',   'o')]),
-    ]
+    specs = []
+    for metric in METRICS:
+        fields = metric_fields(metric)
+        if len(fields) == 1:
+            channels = [(fields[0], metric.upper(), 'steelblue', 'o')]
+        else:
+            channels = [(f, ch.upper() if ch == 'ir' else ch.capitalize(), *_CH_STYLE[ch])
+                        for f, ch in zip(fields, _CH_STYLE)]
+        specs.append(dict(title=_SQI_TITLES[metric], ylabel=metric,
+                          lo=p.get(f'{metric}_min'), hi=p.get(f'{metric}_max'),
+                          channels=channels))
 
-    # Composite SQI — compute and min-max normalise across all windows
-    raw_scores = np.array([composite_sqi_score(w) for w in all_windows])
-    lo_s, hi_s = raw_scores.min(), raw_scores.max()
-    composite_scores = (raw_scores - lo_s) / (hi_s - lo_s) if hi_s > lo_s else np.zeros(n)
+    composite_scores = normalised_composite(all_windows, fit_composite_sqi_scaler(all_windows))
     composite_min = p.get('composite_min')
     n_composite_fails = int((composite_scores < composite_min).sum()) if composite_min is not None else 0
 
@@ -431,10 +391,8 @@ def _plot_sqi(
         n_fails = _fails(lo, hi, *[c[0] for c in chs])
         pct     = 100.0 * n_fails / n if n > 0 else 0.0
 
-        for field, label, marker in chs:
-            v   = _v(field)
-            col = CH_COL.get(label, 'grey')
-            ax.scatter(x, v, s=7, marker=marker, c=col, alpha=0.5, lw=0,
+        for field, label, col, marker in chs:
+            ax.scatter(x, _v(field), s=7, marker=marker, c=col, alpha=0.5, lw=0,
                        label=label)
 
         if lo is not None:
@@ -477,7 +435,7 @@ def _plot_sqi(
 
 
 # ---------------------------------------------------------------------------
-# Bland-Altman plot
+# Plot 3 — Bland-Altman
 # ---------------------------------------------------------------------------
 
 def _plot_bland_altman(
@@ -519,11 +477,11 @@ def _plot_bland_altman(
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
     plt.tight_layout()
-    _save(fig, os.path.join(out_dir, '04_bland_altman.png'))
+    _save(fig, os.path.join(out_dir, '03_bland_altman.png'))
 
 
 # ---------------------------------------------------------------------------
-# Per-subject bias bar chart
+# Plot 4 — per-subject bias
 # ---------------------------------------------------------------------------
 
 def _plot_bias_per_subject(
@@ -566,11 +524,11 @@ def _plot_bias_per_subject(
     ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.25)
     plt.tight_layout()
-    _save(fig, os.path.join(out_dir, '05_bias_per_subject.png'))
+    _save(fig, os.path.join(out_dir, '04_bias_per_subject.png'))
 
 
 # ---------------------------------------------------------------------------
-# Residual histogram
+# Plot 7 — residual histogram
 # ---------------------------------------------------------------------------
 
 def _plot_residuals(
@@ -595,9 +553,7 @@ def _plot_residuals(
         vals = np.array(residuals[model])
         color = colors[idx % len(colors)]
         ax.hist(vals, bins=40, alpha=0.4, color=color, density=True, label=model)
-        # KDE overlay
-        from scipy.stats import gaussian_kde
-        if len(vals) > 1:
+        if len(vals) > 1:                 # smooth density curve on top
             kde = gaussian_kde(vals)
             xs  = np.linspace(vals.min(), vals.max(), 300)
             ax.plot(xs, kde(xs), color=color, lw=1.5)
@@ -625,7 +581,7 @@ def plot_all(
     bp_low:            float,
     bp_high:           float,
     results_raw:       Optional[dict] = None,
-    sqi_params:        Optional[dict] = None,
+    sqi_limits:        Optional[dict] = None,
     combo_results:     Optional[dict] = None,
     combo_results_raw: Optional[dict] = None,
     base_dir:          str = 'plots',
@@ -642,7 +598,7 @@ def plot_all(
     window_s           : window length in seconds
     bp_low/high        : bandpass cut-offs used during feature extraction
     results_raw        : Red-IR results on unfiltered windows for RMSE baseline
-    sqi_params         : SQI threshold dict — when supplied, plot 05 is generated
+    sqi_limits         : the SQI limits used (drawn as lines in plot 05)
     combo_results      : nested dict combo→model→folds from calibrate_all_combos()
     combo_results_raw  : same but on unfiltered windows; adds raw baseline bars per combo
     base_dir           : parent directory; a timestamped sub-folder is created per run
@@ -667,9 +623,9 @@ def plot_all(
         print('Plotting per-subject bias...')
         _plot_bias_per_subject(combo_results, out_dir)
 
-    if sqi_params is not None:
+    if sqi_limits is not None:
         print('Plotting SQI overview...')
-        _plot_sqi(all_windows, kept_ids, sqi_params, out_dir)
+        _plot_sqi(all_windows, sqi_limits, out_dir)
 
     if combo_results is not None:
         print('Plotting LED combination RMSE plots...')

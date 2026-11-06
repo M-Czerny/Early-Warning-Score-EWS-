@@ -1,3 +1,11 @@
+# Local environment and caches
 EWSvenv/
-plots/
 __pycache__/
+*.pyc
+
+# Generated output (each run writes a new timestamped folder)
+plots/
+results/
+
+# Private documents
+thesis/
